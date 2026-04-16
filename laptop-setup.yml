@@ -1,0 +1,175 @@
+---
+- name: Setup Laptop
+  hosts: localhost
+  become: true
+  vars_prompt:
+    - name: bw_user
+      prompt: "Enter your Bitwarden user name"
+      private: false
+
+    - name: bw_pass
+      prompt: "Enter your Bitwarden password"
+      private: true
+
+  tasks:
+    - name: Get Bitwarden Login status
+      ansible.builtin.shell: bw status
+      register: bw_status_raw
+      become: false
+      changed_when: bw_status_raw.rc == 0
+
+    - name: Expand Bitwarden status result
+      ansible.builtin.set_fact:
+        bw_status: "{{ bw_status_raw.stdout | ansible.builtin.from_json }}"
+      become: false
+
+    - name: Log out Bitwarden
+      ansible.builtin.shell: bw logout
+      when: bw_status.status != "unauthenticated"
+      become: false
+      register: bw_status_raw
+      changed_when: bw_status_raw.rc == 0
+
+    - name: Login to Bitwarden
+      ansible.builtin.shell: bw login --raw {{ bw_user | ansible.builtin.quote }} {{ bw_pass | ansible.builtin.quote }}
+      register: bwsessionid
+      become: false
+      changed_when: bwsessionid.rc == 0
+
+
+    - name: Set Hostname
+      ansible.builtin.hostname:
+        name: merlinsbeard.home.lab
+        use: systemd
+
+    - name: Set Power scheme
+      ansible.builtin.command: tuned-adm profile throughput-performance
+
+    - name: Disable Sleep and hibernate
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        masked: true
+      loop:
+        - sleep.target
+        - suspend.target
+        - hibernate.target
+        - hybrid-sleep.target
+
+    - name: disable SELinux
+      ansible.posix.selinux:
+        state: disabled
+        update_kernel_param: true
+
+    - name: Update laptop
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+
+    - name: Install user tools
+      ansible.builtin.dnf:
+        name: "{{ item }}"
+        state: latest
+      loop:
+        - firefox
+        - syncthing
+        - syncthing-tools
+        - gvim
+        - ansible
+
+    - name: Add Flathub
+      community.general.flatpak_remote:
+        name: flathub
+        state: present
+        flatpakrepo_url: https://dl.flathub.org/repo/flathub.flatpakrepo
+
+    - name: Install Flatpaks
+      community.general.flatpak:
+        name: 
+          - com.bitwarden.desktop
+          - md.obsidian.Obsidian
+
+    - name: Setup build environment
+      block:
+      - name: Add Codium repo
+        ansible.builtin.yum_repository:
+          name: gitlab.com_paulcarroty_vscodium_repo
+          description: "vscodium repo"
+          baseurl: https://paulcarroty.gitlab.io/vscodium-deb-rpm-repo/rpms/
+          enabled: true
+          gpgcheck: true
+          gpgkey: https://gitlab.com/paulcarroty/vscodium-deb-rpm-repo/raw/master/pub.gpg
+          metadata_expire: 1440
+          repo_gpgcheck: true
+
+      - name: Install VSCodium and OpenTofu
+        ansible.builtin.dnf:
+          name: "{{ item }}"
+          state: latest
+        loop:
+          - codium
+          - opentofu
+          - python3-pip
+
+      - name: Install Ansible and Ansible Development tools
+        ansible.builtin.pip:
+          name: "{{ item }}"
+          state: latest
+        loop:
+          - ansible-dev-tools
+          - vault-bitwarden-client
+
+      - name: Install Bitwarden CLI Client
+        ansible.builtin.unarchive:
+          src: https://bitwarden.com/download/?app=cli&platform=linux
+          dest: /usr/local/bin
+          remote_src: true
+          mode: "u=rwx,g=rx,o=rx"
+
+      - name: Install VSCodium Extensions
+        ansible.builtin.command: "codium --install-extension {{ item }}"
+        become: no
+        loop:
+          - redhat.ansible
+          - OpenTofu.vscode-opentofu
+          - ms-python.python
+          - GitHub.vscode-pull-request-github
+  #        - GitHub.remotehub    - not in codium yet
+
+      - name: Set Git name and email
+        ansible.builtin.command:
+          cmd: "{{ item }}"
+        become: no
+        loop:
+          - git config set --global user.name 'Craig Hillbeck'
+          - git config set --global user.email 'craig.hillbeck@gmail.com'
+
+    - name: Setup Tailscale
+      block:
+        - name: Add Tailscale repo
+          ansible.builtin.yum_repository:
+            name: Tailscale-Stable
+            description: Tailscale Stable
+            baseurl: https://pkgs.tailscale.com/stable/fedora/$basearch
+            repo_gpgcheck: true
+            gpgkey: https://pkgs.tailscale.com/stable/fedora/repo.gpg
+            gpgcheck: true
+            enabled: true
+            state: present
+        
+        - name: Install Tailscale
+          ansible.builtin.dnf:
+            name: 
+              - tailscale
+              - headscale
+            state: present
+        
+        - name: Enable Tailscale Service
+          ansible.builtin.systemd_service:
+            name: tailscaled
+            state: started
+            enabled: true
+        
+        - name: Start Tailscale
+          ansible.builtin.shell: 
+            cmd: tailscale up --ssh --accept-dns --accept-routes --auth-key={{ lookup('community.general.bitwarden', 'Tailscale-auth-key', field='password', bw_session=bwsessionid.stdout)|first }}
+
