@@ -4,8 +4,63 @@
   become: true
   debugger: never
   vars:
-    var_power_profile: intel-sst
-
+    var_power_profile: accelerator-performance
+    fedora_version: "{{ ansible_facts['distribution_version'] | int }}"
+    grub_nvidia_cmdline: >-
+      GRUB_CMDLINE_LINUX="rhgb quiet rd.driver.blacklist=nouveau,nova_core,nova_drm
+      modprobe.blacklist=nouveau,nova_core,nova_drm nvidia-drm.modeset=1 selinux=0"
+    nvidia_driver_branch: "580xx"
+    local_login_user: >-
+      {{
+        lookup('ansible.builtin.env', 'SUDO_USER')
+        | default(lookup('ansible.builtin.env', 'USER'), true)
+        | default(lookup('ansible.builtin.env', 'LOGNAME'), true)
+        | default(ansible_facts['user_id'], true)
+      }}
+    tailscale_authkey_bitwarden_item: Tailscale-auth-key
+    tailscale_authkey_bitwarden_field: password
+    nextcloud_tailscale_authkey_file: "/home/{{ local_login_user }}/.config/ansible-laptop/nextcloud-tailscale-authkey"
+    nextcloud_aio_container_name_prefix: nextcloud-aio-
+    nextcloud_aio_mastercontainer_name: nextcloud-aio-mastercontainer
+    nextcloud_aio_mastercontainer_volume: nextcloud_aio_mastercontainer
+    nextcloud_aio_network_name: nextcloud-aio
+    nextcloud_aio_project_dir: /opt/nextcloud-aio
+    nextcloud_aio_admin_url: https://127.0.0.1:8080
+    nextcloud_aio_apache_container_name: nextcloud-aio-apache
+    nextcloud_legacy_standalone_project_dir: /opt/nextcloud-compose
+    nextcloud_tailscale_authkey_input: ""
+    nextcloud_tailscale_data_dir: /var/lib/nextcloud-docker/tailscale
+    nextcloud_tailscale_container_name: nextcloud-ts
+    nextcloud_compose_project_name: nextcloud-aio
+    nextcloud_tailscale_proxy_target: "http://{{ nextcloud_aio_apache_container_name }}.{{ nextcloud_aio_network_name }}:11000"
+    syncthing_service_name: "syncthing@{{ local_login_user }}.service"
+    syncthing_config_dir: "/home/{{ local_login_user }}/.local/state/syncthing"
+    syncthing_config_file: "{{ syncthing_config_dir }}/config.xml"
+    syncthing_remote_device_id: "A46YRG4-5H7OU3M-IIYSUU6-FWB52PN-RMXL6XY-35ESJI5-OY7QA4L-J2M5VQB"
+    syncthing_remote_device_name: "Pixel 8 Pro"
+    syncthing_remote_device_address: "tcp://100.120.58.66:20000"
+    syncthing_shared_folders:
+      - id: nw1e1-vf9vx
+        label: "Camera A"
+        path: "/home/{{ local_login_user }}/sync/camera_A"
+      - id: xvohv-pwc5k
+        label: "Camera B"
+        path: "/home/{{ local_login_user }}/sync/camera_B"
+      - id: Documents
+        label: "Documents"
+        path: "/home/{{ local_login_user }}/Documents/Phone"
+      - id: cjvgc-fwms4
+        label: "Obsidian"
+        path: "/home/{{ local_login_user }}/Documents/obsidian/"
+      - id: aqmju-xg0qk
+        label: "Signal Backups"
+        path: "/home/{{ local_login_user }}/sync/backups/signal"
+      - id: a4m55-vpszg
+        label: "Whatsapp Backups"
+        path: "/home/{{ local_login_user }}/sync/backups/whatsapp"
+      - id: ssjag-ryfdf
+        label: "Videos"
+        path: "/home/{{ local_login_user }}/sync/videos"
   vars_prompt:
     - name: bw_user
       prompt: "Enter your Bitwarden user name"
@@ -16,7 +71,24 @@
       private: true
 
   tasks:
-    - name: Main Play loop with Bitwarden
+    - name: Ensure the local login user was detected
+      ansible.builtin.assert:
+        that:
+          - local_login_user | length > 0
+          - local_login_user != 'root'
+        fail_msg: >-
+          local_login_user resolved to root, which would configure user services under /home/root.
+          Run the playbook as your desktop user or pass -e local_login_user=<username>.
+
+    - name: Install Bitwarden CLI Client
+      ansible.builtin.unarchive:
+        src: https://bitwarden.com/download/?app=cli&platform=linux
+        dest: /usr/local/bin
+        remote_src: true
+        creates: /usr/local/bin/bw
+        mode: "u=rwx,g=rx,o=rx"
+
+    - name: Prepare Bitwarden secrets for the playbook
       block:
         - name: Get Bitwarden Login status
           ansible.builtin.command:
@@ -25,7 +97,7 @@
               - status
           register: bw_status_raw
           become: false
-          changed_when: bw_status_raw.rc == 0
+          changed_when: false
 
         - name: Expand Bitwarden status result
           ansible.builtin.set_fact:
@@ -48,220 +120,1892 @@
               - bw
               - login
               - --raw
-              - "{{ bw_user | ansible.builtin.quote }}"
+              - "{{ bw_user }}"
               - "{{ bw_pass }}"
           register: bwsessionid
           become: false
-          changed_when: bwsessionid.rc == 0
-
-
-        - name: Set Hostname
-          ansible.builtin.hostname:
-            name: merlinsbeard.home.lab
-            use: systemd
-
-        - name: Get current Tuned power profile
-          ansible.builtin.command: tuned-adm active
-          register: current_tuned_raw
           changed_when: false
-          failed_when: false
+          no_log: true
 
-        - name: Extract clean profile name
-          ansible.builtin.set_fact:
-            current_tuned_profile: "{{ current_tuned_raw.stdout | regex_replace('^Current active profile: (.*)$', '\\1') | trim | default('none') }}"
-
-        - name: Set Power scheme
-          ansible.builtin.command: tuned-adm profile {{ var_power_profile }}
-          when: current_tuned_profile != var_power_profile
-          register: set_power_scheme
-          changed_when: set_power_scheme.rc = 0
-
-        - name: Disable Sleep and hibernate
-          ansible.builtin.systemd:
-            name: "{{ item }}"
-            masked: true
-          loop:
-            - sleep.target
-            - suspend.target
-            - hibernate.target
-            - hybrid-sleep.target
-
-        - name: Disable SELinux
-          ansible.posix.selinux:
-            state: disabled
-            update_kernel_param: true
-
-        - name: Update laptop
-          ansible.builtin.dnf:
-            name: "*"
-            state: latest
-
-        - name: Install user tools
-          ansible.builtin.dnf:
-            name: "{{ item }}"
-            state: present
-          loop:
-            - firefox
-            - syncthing
-            - syncthing-tools
-            - gvim
-            - ansible
-            - libxcrypt-compat
-
-        - name: Add Flathub
-          community.general.flatpak_remote:
-            name: flathub
-            state: present
-            flatpakrepo_url: https://dl.flathub.org/repo/flathub.flatpakrepo
-
-        - name: Install Flatpaks
-          community.general.flatpak:
-            name:
-              - com.bitwarden.desktop
-              - md.obsidian.Obsidian
-
-        - name: Setup build environment
-          block:
-            - name: Add Codium repo
-              ansible.builtin.yum_repository:
-                name: gitlab.com_paulcarroty_vscodium_repo
-                description: "vscodium repo"
-                baseurl: https://paulcarroty.gitlab.io/vscodium-deb-rpm-repo/rpms/
-                enabled: true
-                gpgcheck: true
-                gpgkey: https://gitlab.com/paulcarroty/vscodium-deb-rpm-repo/raw/master/pub.gpg
-                metadata_expire: 1440
-                repo_gpgcheck: true
-
-            - name: Install VSCodium and OpenTofu
-              ansible.builtin.dnf:
-                name: "{{ item }}"
-                state: present
-              loop:
-                - codium
-                - opentofu
-                - python3-pip
-
-            - name: Install Ansible and Ansible Development tools
-              ansible.builtin.pip:
-                name: "{{ item }}"
-                state: present
-              loop:
-                - ansible-dev-tools
-                - vault-bitwarden-client
-
-            - name: Install Bitwarden CLI Client
-              ansible.builtin.unarchive:
-                src: https://bitwarden.com/download/?app=cli&platform=linux
-                dest: /usr/local/bin
-                remote_src: true
-                mode: "u=rwx,g=rx,o=rx"
-
-            - name: Install VSCodium Extensions
-              ansible.builtin.command: "codium --install-extension {{ item }}"
-              become: false
-              loop:
-                - redhat.ansible
-                - OpenTofu.vscode-opentofu
-                - ms-python.python
-                - GitHub.vscode-pull-request-github
-        #        - GitHub.remotehub    - not in codium yet
-
-            - name: Set Git name and email
-              ansible.builtin.command:
-                cmd: "{{ item }}"
-              become: false
-              loop:
-                - git config set --global user.name 'Craig Hillbeck'
-                - git config set --global user.email 'craig.hillbeck@gmail.com'
-
-        - name: Setup Tailscale
-          block:
-            - name: Add Tailscale repo
-              ansible.builtin.yum_repository:
-                name: Tailscale-Stable
-                description: Tailscale Stable
-                baseurl: https://pkgs.tailscale.com/stable/fedora/$basearch
-                repo_gpgcheck: true
-                gpgkey: https://pkgs.tailscale.com/stable/fedora/repo.gpg
-                gpgcheck: true
-                enabled: true
-                state: present
-
-            - name: Install Tailscale
-              ansible.builtin.dnf:
-                name:
-                  - tailscale
-                  - headscale
-                state: present
-
-            - name: Enable Tailscale Service
-              ansible.builtin.systemd_service:
-                name: tailscaled
-                state: started
-                enabled: true
-
-            - name: Check Tailscale status
-              ansible.builtin.command: tailscale ip
-              register: tailscale_status
-              failed_when: false
-              changed_when: false
-
-            - name: Start Tailscale
-              ansible.builtin.command:
-                argv:
-                  - tailscale
-                  - up
-                  - --ssh
-                  - --accept-dns
-                  - --accept-routes
-                  - >-
-                      --auth-key={{ lookup(
-                        'community.general.bitwarden',
-                        'Tailscale-auth-key',
-                        field='password',
-                        bw_session=bwsessionid.stdout
-                      ) | first }}
-              changed_when: tailscale_status.rc != 0
-
-        - name: Install Webex
-          ansible.builtin.dnf5:
-            name: 'https://binaries.webex.com/WebexDesktop-CentOS-Official-Package/Webex.rpm'
-            state: present
-            disable_gpg_check: true
-
-        - name: Install RPMFusion repo
-          ansible.builtin.dnf5:
-            name: 'https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm'
-            state: present
-            disable_gpg_check: true
-
-        - name: Install libavcodec-freeworld
-          ansible.builtin.dnf5:
-            name: libavcodec-freeworld
-            state: present
-
-      always:
-        - name: Get Bitwarden Login status
+        - name: Sync Bitwarden once for the playbook run
           ansible.builtin.command:
             argv:
               - bw
-              - status
-          register: bw_status_raw
+              - --session
+              - "{{ bwsessionid.stdout }}"
+              - sync
           become: false
-          changed_when: bw_status_raw.rc == 0
+          changed_when: false
+          no_log: true
 
-        - name: Expand Bitwarden status result
+        - name: Cache the Bitwarden-sourced Tailscale auth key
           ansible.builtin.set_fact:
-            bw_status: "{{ bw_status_raw.stdout | ansible.builtin.from_json }}"
+            tailscale_authkey: >-
+              {{
+                (
+                  query(
+                    'community.general.bitwarden',
+                    tailscale_authkey_bitwarden_item,
+                    field=tailscale_authkey_bitwarden_field,
+                    bw_session=bwsessionid.stdout
+                  )
+                  | flatten
+                  | first
+                  | default('', true)
+                  | string
+                )
+                | trim
+              }}
           become: false
+          no_log: true
 
-        - name: Log out off Bitwarden
+        - name: Ensure the Bitwarden-sourced host Tailscale auth key is populated
+          ansible.builtin.assert:
+            that:
+              - tailscale_authkey | length > 0
+              - tailscale_authkey is match('^tskey-auth-')
+            fail_msg: >-
+              Bitwarden item `{{ tailscale_authkey_bitwarden_item }}` did not contain a
+              usable Tailscale auth key in field `{{ tailscale_authkey_bitwarden_field }}`.
+          no_log: true
+
+      always:
+        - name: Log out Bitwarden after resolving startup secrets
           ansible.builtin.command:
             argv:
               - bw
               - logout
-          when: bw_status.status != "unauthenticated"
           become: false
-          register: bw_status_raw
-          changed_when: bw_status_raw.rc == 0
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+    - name: Cache the Nextcloud Tailscale auth key
+      ansible.builtin.set_fact:
+        nextcloud_tailscale_authkey: >-
+          {{
+            (nextcloud_tailscale_authkey_input | trim)
+            if (nextcloud_tailscale_authkey_input | trim | length > 0)
+            else tailscale_authkey
+          }}
+      no_log: true
+
+    - name: Ensure the resolved Nextcloud Tailscale auth key is populated
+      ansible.builtin.assert:
+        that:
+          - nextcloud_tailscale_authkey | default('') | length > 0
+        fail_msg: >-
+          A Tailscale auth key is required for the Nextcloud sidecar. Pass
+          -e nextcloud_tailscale_authkey_input=<auth-key>, or populate Bitwarden item
+          `{{ tailscale_authkey_bitwarden_item }}` field `{{ tailscale_authkey_bitwarden_field }}`.
+      no_log: true
+
+    - name: Set Hostname
+      ansible.builtin.hostname:
+        name: merlinsbeard.home.lab
+        use: systemd
+
+    - name: Refresh hostname facts after setting the hostname
+      ansible.builtin.setup:
+        filter:
+          - ansible_hostname
+          - ansible_fqdn
+
+    - name: Get current Tuned power profile
+      ansible.builtin.command: tuned-adm active
+      register: current_tuned_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Extract clean profile name
+      ansible.builtin.set_fact:
+        current_tuned_profile: "{{ current_tuned_raw.stdout | regex_replace('^Current active profile: (.*)$', '\\1') | trim | default('none') }}"
+
+    - name: Set Power scheme
+      ansible.builtin.command:
+        argv:
+          - tuned-adm
+          - profile
+          - "{{ var_power_profile }}"
+      when: current_tuned_profile != var_power_profile
+      register: set_power_scheme
+      changed_when: set_power_scheme.rc == 0
+      ignore_errors: true
+
+    - name: Print debug info about current power profile and the proposed change
+      ansible.builtin.debug:
+        msg: >-
+          Current power profile is {{ current_tuned_profile }} and the desired profile is
+          {{ var_power_profile }}. Power profile change was attempted:
+          {{ set_power_scheme is defined and set_power_scheme.rc is defined }} and resulted in
+          {{ 'a change' if set_power_scheme is defined and set_power_scheme.rc is defined and set_power_scheme.rc == 0 else 'no change' }}.
+
+    - name: Disable Sleep and hibernate
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        masked: true
+      loop:
+        - sleep.target
+        - suspend.target
+        - hibernate.target
+        - hybrid-sleep.target
+
+    - name: Disable SELinux
+      ansible.posix.selinux:
+        state: disabled
+        update_kernel_param: true
+
+    - name: Update laptop  # noqa: package-latest
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+
+    - name: Install user tools
+      ansible.builtin.dnf:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - firefox
+        - syncthing
+        - syncthing-tools
+        - gvim
+        - ansible
+        - flatpak
+        - libxcrypt-compat
+
+    - name: Enable and start Syncthing for the login user
+      ansible.builtin.systemd:
+        name: "{{ syncthing_service_name }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for Syncthing to create its configuration file
+      ansible.builtin.wait_for:
+        path: "{{ syncthing_config_file }}"
+        timeout: 60
+
+    - name: Wait for the Syncthing API to become available
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8384/rest/noauth/health
+        method: GET
+        status_code: 200
+      register: syncthing_api_health
+      until: syncthing_api_health.status == 200
+      retries: 12
+      delay: 5
+
+    - name: List configured Syncthing folders
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - list
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      register: syncthing_configured_folders
+      changed_when: false
+
+    - name: Remove the generated default Syncthing folder
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - default
+          - delete
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      when: "'default' in syncthing_configured_folders.stdout_lines"
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: List configured Syncthing devices
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - list
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      register: syncthing_configured_devices
+      changed_when: false
+
+    - name: Add the Pixel 8 Pro Syncthing device
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - add
+          - "--device-id={{ syncthing_remote_device_id }}"
+          - "--name={{ syncthing_remote_device_name }}"
+          - "--addresses={{ syncthing_remote_device_address }}"
+          - --compression=metadata
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      when: syncthing_remote_device_id not in syncthing_configured_devices.stdout_lines
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: Read the Pixel 8 Pro Syncthing device name
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - "{{ syncthing_remote_device_id }}"
+          - name
+          - get
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      register: syncthing_remote_device_name_current
+      changed_when: false
+
+    - name: Set the Pixel 8 Pro Syncthing device name
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - "{{ syncthing_remote_device_id }}"
+          - name
+          - set
+          - "{{ syncthing_remote_device_name }}"
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      when: syncthing_remote_device_name_current.stdout != syncthing_remote_device_name
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: List Pixel 8 Pro Syncthing device address slots
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - "{{ syncthing_remote_device_id }}"
+          - addresses
+          - list
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      register: syncthing_remote_device_address_slots
+      changed_when: false
+
+    - name: Read the Pixel 8 Pro primary Syncthing address
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - "{{ syncthing_remote_device_id }}"
+          - addresses
+          - "0"
+          - get
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      register: syncthing_remote_device_address_current
+      changed_when: false
+      when: "'0' in syncthing_remote_device_address_slots.stdout_lines"
+
+    - name: Set the Pixel 8 Pro primary Syncthing address
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - "{{ syncthing_remote_device_id }}"
+          - addresses
+          - "0"
+          - set
+          - "{{ syncthing_remote_device_address }}"
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      when:
+        - "'0' in syncthing_remote_device_address_slots.stdout_lines"
+        - (syncthing_remote_device_address_current.stdout | default('')) != syncthing_remote_device_address
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: Add the Pixel 8 Pro primary Syncthing address
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - "{{ syncthing_remote_device_id }}"
+          - addresses
+          - add
+          - "{{ syncthing_remote_device_address }}"
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      when: "'0' not in syncthing_remote_device_address_slots.stdout_lines"
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: Remove extra Pixel 8 Pro Syncthing addresses
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - devices
+          - "{{ syncthing_remote_device_id }}"
+          - addresses
+          - "{{ item }}"
+          - delete
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_remote_device_address_slots.stdout_lines | reject('equalto', '0') | sort(reverse=True) | list }}"
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: Create Syncthing shared folder directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ local_login_user }}"
+        group: "{{ local_login_user }}"
+        mode: '0755'
+      loop: "{{ syncthing_shared_folders }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    - name: Add configured Syncthing shared folders
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - add
+          - "--id={{ item.id }}"
+          - "--label={{ item.label }}"
+          - "--path={{ item.path }}"
+          - --type=sendreceive
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_shared_folders }}"
+      loop_control:
+        label: "{{ item.label }}"
+      when: item.id not in syncthing_configured_folders.stdout_lines
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: Read configured Syncthing shared folder labels
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - "{{ item.id }}"
+          - label
+          - get
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_shared_folders }}"
+      loop_control:
+        label: "{{ item.label }}"
+      register: syncthing_folder_labels_current
+      changed_when: false
+
+    - name: Set configured Syncthing shared folder labels
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - "{{ item.item.id }}"
+          - label
+          - set
+          - "{{ item.item.label }}"
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_folder_labels_current.results }}"
+      loop_control:
+        label: "{{ item.item.label }}"
+      when: item.stdout != item.item.label
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: Read configured Syncthing shared folder paths
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - "{{ item.id }}"
+          - path
+          - get
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_shared_folders }}"
+      loop_control:
+        label: "{{ item.label }}"
+      register: syncthing_folder_paths_current
+      changed_when: false
+
+    - name: Set configured Syncthing shared folder paths
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - "{{ item.item.id }}"
+          - path
+          - set
+          - "{{ item.item.path }}"
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_folder_paths_current.results }}"
+      loop_control:
+        label: "{{ item.item.label }}"
+      when: item.stdout != item.item.path
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: Read configured Syncthing shared folder types
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - "{{ item.id }}"
+          - type
+          - get
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_shared_folders }}"
+      loop_control:
+        label: "{{ item.label }}"
+      register: syncthing_folder_types_current
+      changed_when: false
+
+    - name: Set configured Syncthing shared folder types
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - "{{ item.item.id }}"
+          - type
+          - set
+          - sendreceive
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_folder_types_current.results }}"
+      loop_control:
+        label: "{{ item.item.label }}"
+      when: item.stdout != 'sendreceive'
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: List devices attached to configured Syncthing folders
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - "{{ item.id }}"
+          - devices
+          - list
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_shared_folders }}"
+      loop_control:
+        label: "{{ item.label }}"
+      register: syncthing_folder_device_lists
+      changed_when: false
+
+    - name: Attach the Pixel 8 Pro to configured Syncthing folders
+      ansible.builtin.command:
+        argv:
+          - syncthing
+          - cli
+          - config
+          - folders
+          - "{{ item.item.id }}"
+          - devices
+          - add
+          - "--device-id={{ syncthing_remote_device_id }}"
+      become_user: "{{ local_login_user }}"
+      become: true
+      environment:
+        HOME: "/home/{{ local_login_user }}"
+      loop: "{{ syncthing_folder_device_lists.results }}"
+      loop_control:
+        label: "{{ item.item.label }}"
+      when: syncthing_remote_device_id not in (item.stdout_lines | default([]))
+      changed_when: true
+      notify: Restart Syncthing
+
+    - name: Add Flathub
+      community.general.flatpak_remote:
+        name: flathub
+        state: present
+        flatpakrepo_url: https://dl.flathub.org/repo/flathub.flatpakrepo
+
+    - name: Install Flatpaks
+      community.general.flatpak:
+        name:
+          - com.bitwarden.desktop
+          - md.obsidian.Obsidian
+
+    - name: Setup build environment
+      block:
+        - name: Add Codium repo
+          ansible.builtin.yum_repository:
+            name: gitlab.com_paulcarroty_vscodium_repo
+            description: "vscodium repo"
+            baseurl: https://paulcarroty.gitlab.io/vscodium-deb-rpm-repo/rpms/
+            enabled: true
+            gpgcheck: true
+            gpgkey: https://gitlab.com/paulcarroty/vscodium-deb-rpm-repo/raw/master/pub.gpg
+            metadata_expire: 1440
+            repo_gpgcheck: true
+
+        - name: Install VSCodium and OpenTofu
+          ansible.builtin.dnf:
+            name: "{{ item }}"
+            state: present
+          loop:
+            - codium
+            - opentofu
+            - python3-pip
+
+        - name: Install Ansible and Ansible Development tools
+          ansible.builtin.pip:
+            name: "{{ item }}"
+            state: present
+          loop:
+            - ansible-dev-tools
+            - vault-bitwarden-client
+
+        - name: Install VSCodium Extensions
+          ansible.builtin.command: "codium --install-extension {{ item }}"
+          become: false
+          changed_when: false
+          loop:
+            - redhat.ansible
+            - OpenTofu.vscode-opentofu
+            - ms-python.python
+            - GitHub.vscode-pull-request-github
+    #        - GitHub.remotehub    - not in codium yet
+
+        - name: Set Git name and email
+          ansible.builtin.command:
+            cmd: "{{ item }}"
+          become: false
+          changed_when: false
+          loop:
+            - git config set --global user.name 'Craig Hillbeck'
+            - git config set --global user.email 'craig.hillbeck@gmail.com'
+
+    - name: Setup Tailscale
+      block:
+        - name: Add Tailscale repo
+          ansible.builtin.yum_repository:
+            name: Tailscale-Stable
+            description: Tailscale Stable
+            baseurl: https://pkgs.tailscale.com/stable/fedora/$basearch
+            repo_gpgcheck: true
+            gpgkey: https://pkgs.tailscale.com/stable/fedora/repo.gpg
+            gpgcheck: true
+            enabled: true
+            state: present
+
+        - name: Install Tailscale
+          ansible.builtin.dnf:
+            name:
+              - tailscale
+              - headscale
+            state: present
+
+        - name: Enable Tailscale Service
+          ansible.builtin.systemd_service:
+            name: tailscaled
+            state: started
+            enabled: true
+
+        - name: Check Tailscale status
+          ansible.builtin.command: tailscale ip
+          register: tailscale_status
+          failed_when: false
+          changed_when: false
+
+        - name: Start Tailscale
+          ansible.builtin.command:
+            argv:
+              - tailscale
+              - up
+              - --ssh
+              - --accept-dns
+              - --accept-routes
+              - "--auth-key={{ tailscale_authkey }}"
+          register: tailscale_up
+          changed_when: tailscale_up.rc == 0
+          when: tailscale_status.rc != 0
+          no_log: true
+
+        - name: Read Tailscale settings when already connected
+          ansible.builtin.command:
+            argv:
+              - tailscale
+              - debug
+              - prefs
+              - --pretty
+          register: tailscale_settings_raw
+          changed_when: false
+          when: tailscale_status.rc == 0
+
+        - name: Determine whether Tailscale settings need reconciliation
+          ansible.builtin.set_fact:
+            tailscale_settings_update_needed: >-
+              {{
+                'ssh=true' not in tailscale_settings_raw.stdout
+                or 'dns=true' not in tailscale_settings_raw.stdout
+                or 'ra=true' not in tailscale_settings_raw.stdout
+              }}
+          when: tailscale_status.rc == 0
+
+        - name: Reconcile Tailscale settings when already connected
+          ansible.builtin.command:
+            argv:
+              - tailscale
+              - set
+              - --ssh=true
+              - --accept-dns=true
+              - --accept-routes=true
+          register: tailscale_settings
+          changed_when: tailscale_settings.rc == 0
+          when:
+            - tailscale_status.rc == 0
+            - tailscale_settings_update_needed | bool
+
+    - name: Remove Webex
+      ansible.builtin.dnf:
+        name: webex
+        state: absent
+        disable_gpg_check: true
+
+    - name: Enable RPM Fusion repos
+      ansible.builtin.dnf:
+        name:
+          - "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-{{ fedora_version }}.noarch.rpm"
+          - "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{{ fedora_version }}.noarch.rpm"
+        state: present
+        disable_gpg_check: true
+
+    - name: Install libavcodec-freeworld
+      ansible.builtin.dnf:
+        name: libavcodec-freeworld
+        state: present
+
+    - name: Gather installed packages before NVIDIA validation
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Check whether the proprietary NVIDIA module is already loaded
+      ansible.builtin.command: lsmod
+      register: nvidia_lsmod_initial
+      changed_when: false
+
+    - name: Check which kernel driver currently owns the NVIDIA GPU
+      ansible.builtin.command:
+        argv:
+          - lspci
+          - -nnk
+          - -d
+          - "10de:139b"
+      register: nvidia_pci_status_initial
+      changed_when: false
+      failed_when: false
+
+    - name: Cache NVIDIA driver readiness
+      ansible.builtin.set_fact:
+        nvidia_driver_packages_present: >-
+          {{
+            ('akmod-nvidia-' ~ nvidia_driver_branch) in (ansible_facts.packages.keys() | list)
+            and ('xorg-x11-drv-nvidia-' ~ nvidia_driver_branch) in (ansible_facts.packages.keys() | list)
+          }}
+        nvidia_driver_ready: >-
+          {{
+            (('akmod-nvidia-' ~ nvidia_driver_branch) in (ansible_facts.packages.keys() | list))
+            and (('xorg-x11-drv-nvidia-' ~ nvidia_driver_branch) in (ansible_facts.packages.keys() | list))
+            and 'nvidia ' in nvidia_lsmod_initial.stdout
+            and 'Kernel driver in use: nvidia' in (nvidia_pci_status_initial.stdout | default(''))
+          }}
+
+    - name: Skip NVIDIA driver installation because it is already installed and active
+      ansible.builtin.debug:
+        msg: >-
+          NVIDIA {{ nvidia_driver_branch }} is already installed, the kernel module is loaded,
+          and the GPU is bound to the proprietary driver. Skipping the install path.
+      when: nvidia_driver_ready
+
+    - name: Update dnf cache and upgrade system  # noqa: package-latest
+      ansible.builtin.dnf:
+        update_cache: true
+        name: "*"
+        state: latest
+      when: not nvidia_driver_ready
+
+    - name: Install developer tools for module compilation
+      ansible.builtin.dnf:
+        name:
+          - "@Development Tools"
+          - gcc
+          - make
+          - elfutils-libelf-devel
+        state: present
+      when: not nvidia_driver_ready
+
+    - name: Import RPM Fusion GPG keys
+      ansible.builtin.rpm_key:
+        key: "{{ item }}"
+        state: present
+      loop:
+        - /usr/share/distribution-gpg-keys/rpmfusion/RPM-GPG-KEY-rpmfusion-free-fedora-{{ fedora_version }}
+        - /usr/share/distribution-gpg-keys/rpmfusion/RPM-GPG-KEY-rpmfusion-nonfree-fedora-{{ fedora_version }}
+      failed_when: false
+      when: not nvidia_driver_ready
+
+    - name: Remove legacy kernel pinning from dnf config
+      community.general.ini_file:
+        path: /etc/dnf/dnf.conf
+        section: main
+        option: exclude
+        state: absent
+        mode: '0644'
+      when: not nvidia_driver_ready
+
+    - name: Install matching kernel build prerequisites for akmods
+      ansible.builtin.dnf:
+        name:
+          - kernel-devel-matched
+          - kernel-headers
+        state: present
+        disable_excludes: all
+      when: not nvidia_driver_ready
+
+    - name: Blacklist nouveau and nova drivers for proprietary NVIDIA
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/blacklist-nouveau.conf
+        content: |
+          blacklist nouveau
+          options nouveau modeset=0
+          blacklist nova_core
+          blacklist nova_drm
+        mode: '0644'
+      notify: Regenerate initramfs
+      when: not nvidia_driver_ready
+
+    - name: Set GRUB cmdline for proprietary NVIDIA
+      ansible.builtin.lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX='
+        line: "{{ grub_nvidia_cmdline }}"
+        backup: true
+      notify:
+        - Update grub
+        - Regenerate initramfs
+      when: not nvidia_driver_ready
+
+    - name: Ensure RPM Fusion free and nonfree repos are enabled
+      ansible.builtin.dnf:
+        name:
+          - "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-{{ fedora_version }}.noarch.rpm"
+          - "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{{ fedora_version }}.noarch.rpm"
+        state: present
+        disable_gpg_check: false
+      when: not nvidia_driver_ready
+
+    - name: Remove legacy NVIDIA 470xx driver packages
+      ansible.builtin.dnf:
+        name:
+          - akmod-nvidia-470xx
+          - nvidia-settings-470xx
+          - xorg-x11-drv-nvidia-470xx
+          - xorg-x11-drv-nvidia-470xx-cuda
+          - xorg-x11-drv-nvidia-470xx-cuda-libs
+          - xorg-x11-drv-nvidia-470xx-kmodsrc
+          - xorg-x11-drv-nvidia-470xx-libs
+        state: absent
+        autoremove: true
+      when: not nvidia_driver_ready
+
+    - name: Remove generic NVIDIA driver packages that select unsupported open modules
+      ansible.builtin.dnf:
+        name:
+          - akmod-nvidia
+          - kmod-nvidia-*
+          - nvidia-kmod-common
+          - xorg-x11-drv-nvidia
+          - xorg-x11-drv-nvidia-cuda
+          - xorg-x11-drv-nvidia-cuda-libs
+          - xorg-x11-drv-nvidia-kmodsrc
+          - xorg-x11-drv-nvidia-libs
+          - xorg-x11-drv-nvidia-power
+          - nvidia-settings
+          - nvidia-persistenced
+        state: absent
+        autoremove: true
+        allowerasing: true
+      when: not nvidia_driver_ready
+
+    - name: Install NVIDIA driver packages for Maxwell GPU
+      ansible.builtin.dnf:
+        name:
+          - "akmod-nvidia-{{ nvidia_driver_branch }}"
+          - "xorg-x11-drv-nvidia-{{ nvidia_driver_branch }}"
+          - "xorg-x11-drv-nvidia-{{ nvidia_driver_branch }}-cuda"
+          - "nvidia-settings-{{ nvidia_driver_branch }}"
+          - nvidia-modprobe
+        state: present
+        allowerasing: true
+      register: nvidia_driver_install
+      when: not nvidia_driver_ready
+
+    - name: Wait for akmod-nvidia modules to be available for the running kernel
+      ansible.builtin.command:
+        argv:
+          - modinfo
+          - -k
+          - "{{ ansible_facts['kernel'] }}"
+          - nvidia
+      register: nvidia_module_check
+      until: nvidia_module_check.rc == 0
+      retries: 10
+      delay: 30
+      changed_when: false
+      failed_when: false
+      when: not nvidia_driver_ready
+
+    - name: Load the NVIDIA kernel module when it is installed but not yet active
+      ansible.builtin.command:
+        argv:
+          - modprobe
+          - nvidia
+      register: nvidia_modprobe
+      changed_when: nvidia_modprobe.rc == 0
+      failed_when: false
+      when:
+        - not nvidia_driver_ready
+        - nvidia_module_check.rc == 0
+        - "'nvidia ' not in nvidia_lsmod_initial.stdout"
+
+    - name: Re-check whether the proprietary NVIDIA module is loaded
+      ansible.builtin.command: lsmod
+      register: nvidia_lsmod
+      changed_when: false
+      when: not nvidia_driver_ready
+
+    - name: Warn if akmods is still building the NVIDIA module for this kernel
+      ansible.builtin.debug:
+        msg: >-
+          The NVIDIA userspace packages were installed, but `modinfo -k {{ ansible_facts['kernel'] }}`
+          did not find the `nvidia` module within the retry window. This usually means the akmods
+          build for the current kernel is still finishing in the background or needs a reboot before
+          the new module tree is picked up.
+      when:
+        - not nvidia_driver_ready
+        - nvidia_module_check.rc != 0
+        - "'nvidia ' not in nvidia_lsmod.stdout"
+
+    - name: Warn if a reboot is recommended before validating NVIDIA
+      ansible.builtin.debug:
+        msg: >-
+          NVIDIA packages were installed or updated. If `nvidia-smi` still fails after this run,
+          reboot the laptop before retrying NVIDIA validation.
+      when:
+        - not nvidia_driver_ready
+        - nvidia_driver_install.changed
+
+    - name: Re-check which kernel driver currently owns the NVIDIA GPU
+      ansible.builtin.command:
+        argv:
+          - lspci
+          - -nnk
+          - -d
+          - "10de:139b"
+      register: nvidia_pci_status
+      changed_when: false
+      failed_when: false
+      when: not nvidia_driver_ready
+
+    - name: Notify reboot required when nouveau still owns the GPU
+      ansible.builtin.debug:
+        msg: >-
+          The proprietary NVIDIA module is installed, but the GPU is still bound to nouveau in the
+          current boot. Reboot, then rerun the playbook or validate with `lspci -nnk -d 10de:139b`
+          and `nvidia-smi`.
+      when:
+        - not nvidia_driver_ready
+        - "'Kernel driver in use: nvidia' not in nvidia_pci_status.stdout"
+
+    - name: Read Tailscale status for local service hostname configuration
+      ansible.builtin.command:
+        argv:
+          - tailscale
+          - status
+          - --json
+      register: tailscale_status_json
+      changed_when: false
+
+    - name: Ensure Tailscale MagicDNS is available for local service hostnames
+      ansible.builtin.assert:
+        that:
+          - (tailscale_status_json.stdout | from_json).Self is defined
+          - ((tailscale_status_json.stdout | from_json).Self.DNSName | default('') | length) > 0
+        fail_msg: >-
+          Tailscale status did not include Self.DNSName. Ensure this machine is connected to
+          Tailscale and MagicDNS is enabled before configuring Nextcloud over Tailscale.
+
+    - name: Set Nextcloud Tailscale hostname fact
+      ansible.builtin.set_fact:
+        nextcloud_tailscale_hostname: "nextcloud-{{ ansible_facts['hostname'] | lower | regex_replace('[^a-z0-9-]', '-') }}"
+
+    - name: Create Nextcloud local secret directory
+      ansible.builtin.file:
+        path: "{{ nextcloud_tailscale_authkey_file | dirname }}"
+        state: directory
+        owner: "{{ local_login_user }}"
+        group: "{{ local_login_user }}"
+        mode: '0700'
+
+    - name: Persist the resolved Nextcloud Tailscale auth key
+      ansible.builtin.copy:
+        dest: "{{ nextcloud_tailscale_authkey_file }}"
+        content: "{{ nextcloud_tailscale_authkey }}\n"
+        owner: "{{ local_login_user }}"
+        group: "{{ local_login_user }}"
+        mode: '0600'
+      when:
+        - nextcloud_tailscale_authkey | default('') | length > 0
+      no_log: true
+
+    - name: Install Docker repository prerequisites
+      ansible.builtin.dnf:
+        name:
+          - dnf-plugins-core
+        state: present
+
+    - name: Gather installed packages before Docker cleanup
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Cache installed legacy Docker conflicts
+      ansible.builtin.set_fact:
+        docker_legacy_conflicts_installed: >-
+          {{
+            [
+              'docker',
+              'docker-client',
+              'docker-client-latest',
+              'docker-common',
+              'docker-latest',
+              'docker-latest-logrotate',
+              'docker-logrotate',
+              'docker-engine',
+              'podman-docker'
+            ]
+            | select('in', (ansible_facts.packages.keys() | list))
+            | list
+          }}
+
+    - name: Remove conflicting legacy Docker packages
+      ansible.builtin.dnf:
+        name: "{{ docker_legacy_conflicts_installed }}"
+        state: absent
+      when: docker_legacy_conflicts_installed | length > 0
+
+    - name: Check whether the Docker CE repository file already exists
+      ansible.builtin.stat:
+        path: /etc/yum.repos.d/docker-ce.repo
+      register: docker_ce_repo_file
+
+    - name: Add Docker CE repository
+      ansible.builtin.command:
+        argv:
+          - dnf
+          - config-manager
+          - addrepo
+          - --from-repofile
+          - https://download.docker.com/linux/fedora/docker-ce.repo
+      register: docker_repo_add
+      changed_when: "'Adding repo from' in (docker_repo_add.stdout | default('')) or docker_repo_add.rc == 0"
+      when: not docker_ce_repo_file.stat.exists
+
+    - name: Install Docker Engine and Compose plugin
+      ansible.builtin.dnf:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Enable and start Docker
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Add user to Docker group for local CLI access
+      ansible.builtin.user:
+        name: "{{ local_login_user }}"
+        groups: docker
+        append: true
+
+    - name: Find existing Docker containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -a
+          - --format
+          - "{{ '{{json .}}' }}"
+      register: docker_container_list_raw
+      changed_when: false
+
+    - name: Parse existing Docker containers
+      ansible.builtin.set_fact:
+        docker_container_list: >-
+          {{
+            docker_container_list_raw.stdout_lines
+            | map('from_json')
+            | list
+          }}
+
+    - name: Initialize running Nextcloud AIO container list
+      ansible.builtin.set_fact:
+        nextcloud_aio_running_container_names: []
+
+    - name: Record running Nextcloud AIO containers
+      ansible.builtin.set_fact:
+        nextcloud_aio_running_container_names: "{{ nextcloud_aio_running_container_names + [item.Names] }}"
+      loop: "{{ docker_container_list }}"
+      when:
+        - item.Names.startswith(nextcloud_aio_container_name_prefix)
+        - item.State == 'running'
+
+    - name: Show protected Nextcloud AIO containers
+      ansible.builtin.debug:
+        msg: "Preserving running Nextcloud AIO containers: {{ nextcloud_aio_running_container_names | join(', ') }}"
+      when:
+        - nextcloud_aio_running_container_names | length > 0
+
+    - name: Remove OpenClaw and Ollama remnants
+      block:
+        - name: Stop and disable legacy Ollama service when present
+          ansible.builtin.systemd:
+            name: ollama
+            enabled: false
+            state: stopped
+          failed_when: false
+
+        - name: Remove legacy Ollama systemd service unit
+          ansible.builtin.file:
+            path: /etc/systemd/system/ollama.service
+            state: absent
+
+        - name: Stop legacy OpenClaw host services when present
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            enabled: false
+            state: stopped
+          loop:
+            - openclaw-gateway
+            - openclaw
+          failed_when: false
+
+        - name: Remove legacy OpenClaw service units
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/systemd/system/openclaw.service
+            - /etc/systemd/system/openclaw-gateway.service
+
+        - name: Reload systemd after removing OpenClaw and Ollama units
+          ansible.builtin.systemd:
+            daemon_reload: true
+
+        - name: Check whether the old OpenClaw Compose project exists
+          ansible.builtin.stat:
+            path: /opt/openclaw/docker-compose.yml
+          register: openclaw_compose_file
+
+        - name: Stop the old OpenClaw Compose project
+          ansible.builtin.command:
+            argv:
+              - docker
+              - compose
+              - --project-directory
+              - /opt/openclaw
+              - down
+              - --remove-orphans
+          register: openclaw_compose_down
+          changed_when: openclaw_compose_down.rc == 0
+          failed_when: false
+          when: openclaw_compose_file.stat.exists
+
+        - name: Remove OpenClaw host artifacts
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /opt/openclaw
+            - /home/openclaw
+            - /etc/openclaw
+            - /etc/profile.d/openclaw.sh
+            - /usr/local/bin/openclaw
+            - /usr/bin/openclaw
+            - /usr/local/lib/node_modules/openclaw
+            - /usr/lib/node_modules/openclaw
+            - /var/lib/openclaw
+
+        - name: Remove legacy Ollama binaries installed by the old playbook
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /usr/local/bin/ollama
+            - /usr/bin/ollama
+
+    - name: Initialize stale Nextcloud container list
+      ansible.builtin.set_fact:
+        nextcloud_stale_container_names: []
+
+    - name: Record stale Nextcloud containers
+      ansible.builtin.set_fact:
+        nextcloud_stale_container_names: "{{ nextcloud_stale_container_names + [item.Names] }}"
+      loop: "{{ docker_container_list }}"
+      when:
+        - "'nextcloud' in (item.Names | lower)"
+        - >-
+          (
+            not item.Names.startswith(nextcloud_aio_container_name_prefix)
+            and (
+              item.Names != nextcloud_tailscale_container_name
+              or ('com.docker.compose.project=' ~ nextcloud_compose_project_name)
+              not in (item.Labels | default('', true))
+            )
+          )
+          or ((item.Names | regex_search('^nextcloud-(app|db)$')) is not none)
+
+    - name: Remove stale Nextcloud containers from other installs
+      ansible.builtin.command:
+        argv: "{{ ['docker', 'rm', '-f'] + nextcloud_stale_container_names }}"
+      register: nextcloud_stale_container_cleanup
+      changed_when: nextcloud_stale_container_cleanup.rc == 0
+      when: nextcloud_stale_container_names | length > 0
+
+    - name: Check whether the obsolete standalone Nextcloud Compose file exists
+      ansible.builtin.stat:
+        path: "{{ nextcloud_legacy_standalone_project_dir }}/compose.yaml"
+      register: nextcloud_legacy_standalone_compose_file
+
+    - name: Stop the obsolete standalone Nextcloud Compose project
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - --project-directory
+          - "{{ nextcloud_legacy_standalone_project_dir }}"
+          - down
+          - --remove-orphans
+      register: nextcloud_legacy_standalone_compose_down
+      changed_when: nextcloud_legacy_standalone_compose_down.rc == 0
+      failed_when: false
+      when: nextcloud_legacy_standalone_compose_file.stat.exists
+
+    - name: Remove the obsolete standalone Nextcloud Compose project files
+      ansible.builtin.file:
+        path: "{{ nextcloud_legacy_standalone_project_dir }}"
+        state: absent
+      when: nextcloud_legacy_standalone_compose_file.stat.exists
+
+    - name: Inspect the Nextcloud AIO mastercontainer labels
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{json .Config.Labels}}' }}"
+          - "{{ nextcloud_aio_mastercontainer_name }}"
+      register: nextcloud_aio_mastercontainer_labels_raw
+      failed_when: false
+      changed_when: false
+
+    - name: Cache the Nextcloud AIO mastercontainer labels
+      ansible.builtin.set_fact:
+        nextcloud_aio_mastercontainer_labels: "{{ (nextcloud_aio_mastercontainer_labels_raw.stdout | from_json) | default({}, true) }}"
+      when:
+        - nextcloud_aio_mastercontainer_labels_raw.rc == 0
+        - (nextcloud_aio_mastercontainer_labels_raw.stdout | default('') | trim).startswith('{')
+
+    - name: Remove unmanaged Nextcloud AIO mastercontainer
+      ansible.builtin.command:
+        argv:
+          - docker
+          - rm
+          - -f
+          - "{{ nextcloud_aio_mastercontainer_name }}"
+      register: nextcloud_aio_unmanaged_mastercontainer_remove
+      changed_when: nextcloud_aio_unmanaged_mastercontainer_remove.rc == 0
+      when:
+        - nextcloud_aio_mastercontainer_labels_raw.rc == 0
+        - >-
+          (nextcloud_aio_mastercontainer_labels | default({}, true)).get('com.docker.compose.project', '') != nextcloud_compose_project_name
+          or (nextcloud_aio_mastercontainer_labels | default({}, true)).get('com.docker.compose.service', '') != nextcloud_aio_mastercontainer_name
+
+    - name: Pull the Nextcloud AIO mastercontainer image
+      ansible.builtin.command:
+        argv:
+          - docker
+          - pull
+          - ghcr.io/nextcloud-releases/all-in-one:latest
+      register: nextcloud_aio_mastercontainer_pull
+      changed_when: >-
+        'Downloaded newer image' in (nextcloud_aio_mastercontainer_pull.stdout | default(''))
+        or 'Pull complete' in (nextcloud_aio_mastercontainer_pull.stdout | default(''))
+
+    - name: Create Nextcloud AIO Compose directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ nextcloud_aio_project_dir }}", mode: '0750' }
+        - { path: "{{ nextcloud_tailscale_data_dir }}", mode: '0700' }
+
+    - name: Check whether the Nextcloud AIO Docker network exists
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - "{{ nextcloud_aio_network_name }}"
+      register: nextcloud_aio_network_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Create the external Nextcloud AIO Docker network when missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - create
+          - "{{ nextcloud_aio_network_name }}"
+      register: nextcloud_aio_network_create
+      changed_when: nextcloud_aio_network_create.rc == 0
+      when: nextcloud_aio_network_inspect.rc != 0
+
+    - name: Write the Nextcloud AIO Compose environment file
+      ansible.builtin.copy:
+        dest: "{{ nextcloud_aio_project_dir }}/.env"
+        content: |
+          NEXTCLOUD_TAILSCALE_AUTHKEY={{ nextcloud_tailscale_authkey }}
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+
+    - name: Write the Nextcloud AIO Compose file
+      ansible.builtin.copy:
+        dest: "{{ nextcloud_aio_project_dir }}/compose.yaml"
+        owner: root
+        group: root
+        mode: '0640'
+        content: |
+          name: {{ nextcloud_compose_project_name }}
+          services:
+            {{ nextcloud_aio_mastercontainer_name }}:
+              image: ghcr.io/nextcloud-releases/all-in-one:latest
+              init: true
+              restart: always
+              container_name: {{ nextcloud_aio_mastercontainer_name }}
+              volumes:
+                - {{ nextcloud_aio_mastercontainer_volume }}:/mnt/docker-aio-config
+                - /var/run/docker.sock:/var/run/docker.sock:ro
+              networks:
+                - {{ nextcloud_aio_network_name }}
+              ports:
+                - "8080:8080"
+              environment:
+                APACHE_PORT: "11000"
+                APACHE_IP_BINDING: 127.0.0.1
+                SKIP_DOMAIN_VALIDATION: "true"
+            {{ nextcloud_tailscale_container_name }}:
+              image: tailscale/tailscale:stable
+              container_name: {{ nextcloud_tailscale_container_name }}
+              hostname: {{ nextcloud_tailscale_hostname }}
+              environment:
+                TS_AUTHKEY: "${NEXTCLOUD_TAILSCALE_AUTHKEY}"
+                TS_AUTH_ONCE: "false"
+                TS_STATE_DIR: /var/lib/tailscale
+                TS_HOSTNAME: {{ nextcloud_tailscale_hostname }}
+                TS_ACCEPT_DNS: "false"
+              cap_add:
+                - net_admin
+                - net_raw
+              volumes:
+                - {{ nextcloud_tailscale_data_dir }}:/var/lib/tailscale
+              networks:
+                - {{ nextcloud_aio_network_name }}
+              restart: unless-stopped
+
+          networks:
+            {{ nextcloud_aio_network_name }}:
+              name: {{ nextcloud_aio_network_name }}
+              external: true
+
+          volumes:
+            {{ nextcloud_aio_mastercontainer_volume }}:
+              name: {{ nextcloud_aio_mastercontainer_volume }}
+
+    - name: Inspect existing Nextcloud Tailscale sidecar environment
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{range .Config.Env}}{{println .}}{{end}}' }}"
+          - "{{ nextcloud_tailscale_container_name }}"
+      register: nextcloud_tailscale_existing_env
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Remove Nextcloud Tailscale sidecar with malformed auth key environment
+      ansible.builtin.command:
+        argv:
+          - docker
+          - rm
+          - -f
+          - "{{ nextcloud_tailscale_container_name }}"
+      register: nextcloud_tailscale_malformed_env_remove
+      changed_when: nextcloud_tailscale_malformed_env_remove.rc == 0
+      when:
+        - nextcloud_tailscale_existing_env.rc == 0
+        - "'TS_AUTHKEY=[' in (nextcloud_tailscale_existing_env.stdout | default(''))"
+      no_log: true
+
+    - name: Start the Nextcloud AIO mastercontainer and Tailscale sidecar
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - --project-directory
+          - "{{ nextcloud_aio_project_dir }}"
+          - up
+          - -d
+      register: nextcloud_aio_compose_up
+      changed_when: >-
+        (
+          (
+            (nextcloud_aio_compose_up.stdout | default(''))
+            ~ (nextcloud_aio_compose_up.stderr | default(''))
+          )
+          | regex_search('(?i)\\b(created|creating|recreated|recreating|running|started)\\b')
+        ) is not none
+
+    - name: Wait for the Nextcloud AIO admin interface to respond
+      ansible.builtin.uri:
+        url: "{{ nextcloud_aio_admin_url }}"
+        method: GET
+        status_code:
+          - 200
+          - 302
+          - 401
+        validate_certs: false
+      register: nextcloud_aio_admin_http
+      changed_when: false
+      retries: 24
+      delay: 5
+      until: nextcloud_aio_admin_http.status in [200, 302, 401]
+
+    - name: Inspect the Nextcloud AIO mastercontainer state
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.State.Status}}' }}"
+          - "{{ nextcloud_aio_mastercontainer_name }}"
+      register: nextcloud_aio_mastercontainer_status
+      changed_when: false
+
+    - name: Ensure the Nextcloud AIO mastercontainer is running
+      ansible.builtin.assert:
+        that:
+          - nextcloud_aio_mastercontainer_status.stdout == 'running'
+        fail_msg: >-
+          The Nextcloud AIO mastercontainer is not running
+          (state={{ nextcloud_aio_mastercontainer_status.stdout | default('missing') }}).
+          Check `docker logs {{ nextcloud_aio_mastercontainer_name }}` before continuing.
+
+    - name: Check whether a legacy bare-metal Nextcloud install exists
+      ansible.builtin.stat:
+        path: /var/www/nextcloud/config/config.php
+      register: nextcloud_legacy_install_stat
+
+    - name: Disable the legacy Apache-based Nextcloud service
+      ansible.builtin.systemd:
+        name: httpd
+        enabled: false
+        state: stopped
+      failed_when: false
+      when: nextcloud_legacy_install_stat.stat.exists
+
+    - name: Remove the legacy Nextcloud cron entry
+      ansible.builtin.cron:
+        name: Nextcloud background jobs
+        user: apache
+        state: absent
+      when: nextcloud_legacy_install_stat.stat.exists
+
+    - name: Remove the legacy bare-metal Nextcloud install paths
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/www/nextcloud
+        - /etc/httpd/conf.d/nextcloud.conf
+        - /var/lib/nextcloud/data
+      when: nextcloud_legacy_install_stat.stat.exists
+
+    - name: Inspect the Nextcloud Tailscale sidecar state
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.State.Status}}' }}"
+          - "{{ nextcloud_tailscale_container_name }}"
+      register: nextcloud_tailscale_container_status
+      changed_when: false
+
+    - name: Ensure the Nextcloud Tailscale sidecar is running
+      ansible.builtin.assert:
+        that:
+          - nextcloud_tailscale_container_status.stdout == 'running'
+        fail_msg: >-
+          The Nextcloud Tailscale sidecar is not running
+          (state={{ nextcloud_tailscale_container_status.stdout | default('missing') }}).
+          Check `docker logs {{ nextcloud_tailscale_container_name }}` before continuing.
+
+    - name: Wait for the Nextcloud Tailscale sidecar status API
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ nextcloud_tailscale_container_name }}"
+          - tailscale
+          - status
+          - --json
+      register: nextcloud_tailscale_status_raw
+      changed_when: false
+      failed_when: false
+      retries: 12
+      delay: 5
+      until: >-
+        nextcloud_tailscale_status_raw.rc == 0
+        and (nextcloud_tailscale_status_raw.stdout | default('') | trim).startswith('{')
+
+    - name: Ensure the Nextcloud Tailscale sidecar returned status JSON
+      ansible.builtin.assert:
+        that:
+          - nextcloud_tailscale_status_raw.rc == 0
+          - (nextcloud_tailscale_status_raw.stdout | default('') | trim).startswith('{')
+        fail_msg: >-
+          The Nextcloud Tailscale sidecar did not return JSON from `tailscale status --json`
+          (rc={{ nextcloud_tailscale_status_raw.rc | default('unknown') }}).
+          stdout={{ nextcloud_tailscale_status_raw.stdout | default('') | trim | default('empty', true) }}
+          stderr={{ nextcloud_tailscale_status_raw.stderr | default('') | trim | default('empty', true) }}.
+          Check `docker logs {{ nextcloud_tailscale_container_name }}` before continuing.
+
+    - name: Cache the Nextcloud Tailscale sidecar status
+      ansible.builtin.set_fact:
+        nextcloud_tailscale_status: "{{ nextcloud_tailscale_status_raw.stdout | from_json }}"
+        nextcloud_tailscale_status_self: "{{ (nextcloud_tailscale_status_raw.stdout | from_json).Self | default({}) }}"
+
+    - name: Determine whether the Nextcloud Tailscale sidecar needs authentication
+      ansible.builtin.set_fact:
+        nextcloud_tailscale_reauth_needed: >-
+          {{
+            nextcloud_tailscale_status.BackendState != 'Running'
+            or not (nextcloud_tailscale_status_self.Online | default(false))
+          }}
+
+    - name: Default the Nextcloud Tailscale sidecar hostname update state
+      ansible.builtin.set_fact:
+        nextcloud_tailscale_current_hostname: ""
+        nextcloud_tailscale_hostname_update_needed: false
+
+    - name: Cache the authenticated Nextcloud Tailscale sidecar hostname
+      ansible.builtin.set_fact:
+        nextcloud_tailscale_current_hostname: >-
+          {{
+            (
+              nextcloud_tailscale_status_self.HostName
+              | default(
+                nextcloud_tailscale_status_self.DNSName
+                | default('', true)
+                | regex_replace('\\.$', '')
+                | regex_replace('\\..*$', ''),
+                true
+              )
+            )
+            | lower
+          }}
+      when: not (nextcloud_tailscale_reauth_needed | bool)
+
+    - name: Determine whether the Nextcloud Tailscale sidecar hostname differs
+      ansible.builtin.set_fact:
+        nextcloud_tailscale_hostname_update_needed: >-
+          {{
+            nextcloud_tailscale_current_hostname != (nextcloud_tailscale_hostname | lower)
+          }}
+      when: not (nextcloud_tailscale_reauth_needed | bool)
+
+    - name: Update the Nextcloud Tailscale sidecar hostname when it differs
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ nextcloud_tailscale_container_name }}"
+          - tailscale
+          - set
+          - "--hostname={{ nextcloud_tailscale_hostname }}"
+      register: nextcloud_tailscale_hostname_set
+      changed_when: nextcloud_tailscale_hostname_set.rc == 0
+      when: nextcloud_tailscale_hostname_update_needed | bool
+
+    - name: Re-authenticate the Nextcloud Tailscale sidecar when it is logged out
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ nextcloud_tailscale_container_name }}"
+          - tailscale
+          - up
+          - --reset
+          - --accept-dns=false
+          - "--hostname={{ nextcloud_tailscale_hostname }}"
+          - --timeout=30s
+          - "--auth-key={{ nextcloud_tailscale_authkey }}"
+      register: nextcloud_tailscale_auth_up
+      changed_when: nextcloud_tailscale_auth_up.rc == 0
+      failed_when: false
+      retries: 6
+      delay: 10
+      until: nextcloud_tailscale_auth_up.rc == 0
+      no_log: true
+      when:
+        - nextcloud_tailscale_reauth_needed | bool
+
+    - name: Ensure explicit Nextcloud Tailscale sidecar authentication succeeded
+      ansible.builtin.assert:
+        that:
+          - nextcloud_tailscale_auth_up.rc == 0
+        fail_msg: >-
+          Explicit `tailscale up` inside {{ nextcloud_tailscale_container_name }} failed
+          (rc={{ nextcloud_tailscale_auth_up.rc | default('unknown') }}). The auth key is read
+          from Bitwarden item `{{ tailscale_authkey_bitwarden_item }}` unless
+          nextcloud_tailscale_authkey_input is provided. Ensure the key is reusable or
+          preauthorized, then recreate {{ nextcloud_tailscale_container_name }}.
+      when:
+        - nextcloud_tailscale_reauth_needed | bool
+
+    - name: Wait for the Nextcloud Tailscale sidecar after explicit authentication or hostname update
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ nextcloud_tailscale_container_name }}"
+          - tailscale
+          - status
+          - --json
+      register: nextcloud_tailscale_status_raw
+      changed_when: false
+      failed_when: false
+      retries: 24
+      delay: 5
+      until: >-
+        nextcloud_tailscale_status_raw.rc == 0
+        and (nextcloud_tailscale_status_raw.stdout | default('') | trim).startswith('{')
+        and (nextcloud_tailscale_status_raw.stdout | from_json).BackendState == 'Running'
+        and (((nextcloud_tailscale_status_raw.stdout | from_json).Self | default({})).Online | default(false))
+        and (
+          (
+            ((nextcloud_tailscale_status_raw.stdout | from_json).Self | default({})).HostName
+            | default(
+              ((nextcloud_tailscale_status_raw.stdout | from_json).Self | default({})).DNSName
+              | default('', true)
+              | regex_replace('\\.$', '')
+              | regex_replace('\\..*$', ''),
+              true
+            )
+          )
+          | lower
+        ) == (nextcloud_tailscale_hostname | lower)
+      when:
+        - nextcloud_tailscale_reauth_needed | bool or nextcloud_tailscale_hostname_update_needed | bool
+
+    - name: Ensure refreshed Nextcloud Tailscale sidecar status is usable
+      ansible.builtin.assert:
+        that:
+          - nextcloud_tailscale_status_raw.rc == 0
+          - (nextcloud_tailscale_status_raw.stdout | default('') | trim).startswith('{')
+        fail_msg: >-
+          The Nextcloud Tailscale sidecar did not become online with the expected hostname
+          after authentication or hostname update
+          (rc={{ nextcloud_tailscale_status_raw.rc | default('unknown') }}).
+          stdout={{ nextcloud_tailscale_status_raw.stdout | default('') | trim | default('empty', true) }}
+          stderr={{ nextcloud_tailscale_status_raw.stderr | default('') | trim | default('empty', true) }}.
+          Check `docker logs {{ nextcloud_tailscale_container_name }}` before continuing.
+      when:
+        - nextcloud_tailscale_reauth_needed | bool or nextcloud_tailscale_hostname_update_needed | bool
+
+    - name: Cache the Nextcloud Tailscale sidecar status after explicit authentication or hostname update
+      ansible.builtin.set_fact:
+        nextcloud_tailscale_status: "{{ nextcloud_tailscale_status_raw.stdout | from_json }}"
+        nextcloud_tailscale_status_self: "{{ (nextcloud_tailscale_status_raw.stdout | from_json).Self | default({}) }}"
+      when:
+        - nextcloud_tailscale_reauth_needed | bool or nextcloud_tailscale_hostname_update_needed | bool
+
+    - name: Ensure the Nextcloud Tailscale sidecar has joined the tailnet
+      ansible.builtin.assert:
+        that:
+          - nextcloud_tailscale_status.BackendState == 'Running'
+          - nextcloud_tailscale_status_self.Online | default(false)
+          - >-
+            (
+              nextcloud_tailscale_status_self.HostName
+              | default(
+                nextcloud_tailscale_status_self.DNSName
+                | default('', true)
+                | regex_replace('\\.$', '')
+                | regex_replace('\\..*$', ''),
+                true
+              )
+              | lower
+            ) == (nextcloud_tailscale_hostname | lower)
+        fail_msg: >-
+          The Nextcloud Tailscale sidecar is not online with the expected hostname
+          (BackendState={{ nextcloud_tailscale_status.BackendState | default('unknown') }},
+          HostName={{ nextcloud_tailscale_status_self.HostName | default('unknown') }},
+          DNSName={{ nextcloud_tailscale_status_self.DNSName | default('unknown') }},
+          Health={{ nextcloud_tailscale_status.Health | default([]) | join('; ') }}).
+          The playbook writes TS_AUTHKEY from Bitwarden item
+          `{{ tailscale_authkey_bitwarden_item }}` unless nextcloud_tailscale_authkey_input
+          is provided, and also runs explicit `tailscale up` when the sidecar is logged out.
+          The explicit auth command rc was {{ nextcloud_tailscale_auth_up.rc | default('not-run') }}.
+          If the sidecar still needs login, refresh that Bitwarden key so it is reusable
+          or preauthorized, then recreate {{ nextcloud_tailscale_container_name }}.
+
+    - name: Find existing Nextcloud AIO child containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -a
+          - --filter
+          - "label=com.docker.compose.project={{ nextcloud_compose_project_name }}"
+          - --format
+          - "{{ '{{json .}}' }}"
+      register: nextcloud_aio_child_container_list_raw
+      changed_when: false
+
+    - name: Cache exited Nextcloud AIO child containers
+      ansible.builtin.set_fact:
+        nextcloud_aio_exited_child_container_names: >-
+          {{
+            nextcloud_aio_child_container_list_raw.stdout_lines
+            | map('from_json')
+            | selectattr('Names', 'match', '^' ~ nextcloud_aio_container_name_prefix)
+            | rejectattr('Names', 'equalto', nextcloud_aio_mastercontainer_name)
+            | selectattr('State', 'equalto', 'exited')
+            | map(attribute='Names')
+            | list
+          }}
+
+    - name: Restart exited Nextcloud AIO child containers
+      ansible.builtin.command:
+        argv: "{{ ['docker', 'start'] + nextcloud_aio_exited_child_container_names }}"
+      register: nextcloud_aio_child_container_start
+      changed_when: nextcloud_aio_child_container_start.rc == 0
+      when: nextcloud_aio_exited_child_container_names | length > 0
+
+    - name: Inspect the Nextcloud AIO Apache child container state
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.State.Status}}' }}"
+          - "{{ nextcloud_aio_apache_container_name }}"
+      register: nextcloud_aio_apache_container_status
+      changed_when: false
+      failed_when: false
+      ignore_errors: true
+      retries: 12
+      delay: 5
+      until: >-
+        nextcloud_aio_apache_container_status.rc != 0
+        or nextcloud_aio_apache_container_status.stdout == 'running'
+        or (nextcloud_aio_exited_child_container_names | length) == 0
+
+    - name: Explain that Nextcloud AIO child containers still need to be started
+      ansible.builtin.debug:
+        msg: >-
+          The Nextcloud AIO Apache child container is not running
+          (state={{ nextcloud_aio_apache_container_status.stdout | default('missing', true) }}).
+          Tailscale Serve will still be configured for {{ nextcloud_tailscale_proxy_target }},
+          but Nextcloud will not respond until the AIO stack is started from {{ nextcloud_aio_admin_url }}.
+      when: nextcloud_aio_apache_container_status.stdout != 'running'
+
+    - name: Validate the running Nextcloud AIO Apache endpoint from the sidecar
+      when: nextcloud_aio_apache_container_status.stdout == 'running'
+      block:
+        - name: Verify the Nextcloud endpoint is reachable from the Tailscale sidecar
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ nextcloud_tailscale_container_name }}"
+              - wget
+              - -q
+              - -T
+              - "5"
+              - -O
+              - /dev/null
+              - "{{ nextcloud_tailscale_proxy_target }}/status.php"
+          register: nextcloud_tailscale_upstream_check
+          changed_when: false
+          retries: 12
+          delay: 5
+          until: nextcloud_tailscale_upstream_check.rc == 0
+      rescue:
+        - name: Explain unreachable Nextcloud AIO Apache child container
+          ansible.builtin.fail:
+            msg: >-
+              The Nextcloud Tailscale sidecar cannot reach
+              {{ nextcloud_tailscale_proxy_target }}/status.php even though
+              {{ nextcloud_aio_apache_container_name }} is running. Check that both containers
+              are attached to the {{ nextcloud_aio_network_name }} Docker network and inspect
+              `docker logs {{ nextcloud_aio_apache_container_name }}`.
+
+    - name: Ensure the Nextcloud Tailscale sidecar serves the container over HTTPS
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ nextcloud_tailscale_container_name }}"
+          - tailscale
+          - serve
+          - --bg
+          - --yes
+          - --https=443
+          - "{{ nextcloud_tailscale_proxy_target }}"
+      register: nextcloud_tailscale_serve
+      changed_when: >-
+        'Available within your tailnet' in (nextcloud_tailscale_serve.stdout | default(''))
+        or 'proxy' in (nextcloud_tailscale_serve.stdout | default('') | lower)
+
+    - name: Read the Nextcloud Tailscale serve status
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ nextcloud_tailscale_container_name }}"
+          - tailscale
+          - serve
+          - status
+      register: nextcloud_tailscale_serve_status
+      changed_when: false
+
+  handlers:
+    - name: Update grub
+      ansible.builtin.command:
+        argv:
+          - grub2-mkconfig
+          - -o
+          - /boot/grub2/grub.cfg
+      changed_when: true
+
+    - name: Regenerate initramfs
+      ansible.builtin.command:
+        argv:
+          - dracut
+          - --force
+          - /boot/initramfs-{{ ansible_facts['kernel'] }}.img
+          - "{{ ansible_facts['kernel'] }}"
+      changed_when: true
+
+    - name: Restart Syncthing
+      ansible.builtin.systemd:
+        name: "{{ syncthing_service_name }}"
+        state: restarted

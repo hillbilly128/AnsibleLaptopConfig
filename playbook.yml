@@ -1,0 +1,3075 @@
+---
+- name: Provision a fresh Fedora 44 laptop for local AI services
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  vars:
+    fedora_release_major: 44
+    bitwarden_bw_session: "{{ lookup('ansible.builtin.env', 'BW_SESSION') }}"
+    local_login_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id, true) }}"
+    local_login_uid: "{{ lookup('ansible.builtin.pipe', 'id -u ' ~ local_login_user) }}"
+
+    system_base_packages:
+      - pciutils
+      - jq
+      - curl
+      - git
+      - firewalld
+      - python3-libselinux
+      - python3-requests
+      - python3-pip
+      - dnf-plugins-core
+      - distribution-gpg-keys
+
+    docker_conflicting_packages:
+      - docker
+      - docker-client
+      - docker-client-latest
+      - docker-common
+      - docker-latest
+      - docker-latest-logrotate
+      - docker-logrotate
+      - docker-selinux
+      - docker-engine-selinux
+      - docker-engine
+    podman_cleanup_packages:
+      - podman
+      - crun
+      - buildah
+      - skopeo
+      - containernetworking-plugins
+      - fuse-overlayfs
+      - slirp4netns
+    docker_repo_file: /etc/yum.repos.d/docker-ce.repo
+    docker_repo_url: https://download.docker.com/linux/fedora/docker-ce.repo
+    docker_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    docker_host_gateway_alias: host.docker.internal
+    firewalld_backend: iptables
+
+    nvidia_package_map:
+      latest:
+        - akmod-nvidia
+        - xorg-x11-drv-nvidia
+        - xorg-x11-drv-nvidia-cuda
+        - nvidia-settings
+        - nvidia-modprobe
+      580xx:
+        - akmod-nvidia-580xx
+        - xorg-x11-drv-nvidia-580xx
+        - xorg-x11-drv-nvidia-580xx-cuda
+        - nvidia-settings-580xx
+        - nvidia-modprobe
+    nvidia_core_package_map:
+      latest:
+        - akmod-nvidia
+        - xorg-x11-drv-nvidia
+      580xx:
+        - akmod-nvidia-580xx
+        - xorg-x11-drv-nvidia-580xx
+
+    # Override this when RPM Fusion needs a specific legacy branch for your card.
+    nvidia_force_driver_branch: ""
+    nvidia_legacy_branch_regex_map:
+      '(?i)GeForce GTX 9[0-9]{2}M': '580xx'
+      '(?i)Quadro M[0-9]{3,4}': '580xx'
+      '(?i)Tesla M[0-9]{2,3}': '580xx'
+    nvidia_legacy_device_id_map:
+      "139b": "580xx"
+    reboot_if_required_for_nvidia: true
+
+    tailscale_repo_baseurl: "https://pkgs.tailscale.com/stable/fedora/$basearch"
+    tailscale_repo_gpgkey: "https://pkgs.tailscale.com/stable/fedora/repo.gpg"
+    tailscale_accept_routes: true
+    tailscale_accept_dns: true
+    tailscale_enable_ssh: true
+    tailscale_extra_up_flags: []
+    tailscale_sidecar_image: docker.io/tailscale/tailscale:stable
+    tailscale_services_root: "{{ containers_root }}/tailscale-services"
+    tailscale_sidecar_up_timeout: "180s"
+    tailscale_control_plane_probe_urls:
+      - https://controlplane.tailscale.com
+      - https://log.tailscale.com
+    podman_firewalld_egress_policy_name: ai-services-podman-egress
+    podman_netavark_firewall_driver_config_path: /etc/containers/containers.conf.d/50-ai-services-network.conf
+    legacy_podman_network_name: ai_services
+
+    containers_root: /srv/containers
+    ai_services_docker_network_name: ai_services
+
+    ollama_container_name: ollama
+    ollama_image: docker.io/ollama/ollama:latest
+    ollama_state_dir: "{{ containers_root }}/ollama"
+    ollama_publish_host: "127.0.0.1"
+    ollama_port: 11434
+    ollama_models: [qwen3.5:4b, qwen3.5:2b, nomic-embed-text]
+    ollama_timeout_seconds: 300
+    ollama_keep_alive: "15m"
+    openclaw_chat_context_window: 32768
+    openclaw_chat_max_tokens: 512
+    ollama_model_pull_retries: 5
+    ollama_model_pull_delay: 20
+    ollama_model_pull_timeout: 1800
+    ollama_fail_on_model_pull_error: false
+
+    openclaw_container_name: openclaw
+    openclaw_base_image: "ghcr.io/openclaw/openclaw:latest"
+    openclaw_image: "openclaw-with-brew:latest"
+    openclaw_container_pull_policy: false
+    openclaw_gateway_port: 18789
+    openclaw_state_dir: "{{ containers_root }}/openclaw/state"
+    openclaw_workspace_dir: "{{ containers_root }}/openclaw/workspace"
+    openclaw_config_dir: "{{ containers_root }}/openclaw/config"
+    openclaw_secrets_dir: "{{ containers_root }}/openclaw/secrets"
+    openclaw_memory_limit: "8g"
+    openclaw_memory_reservation: "4g"
+    openclaw_default_model: "qwen3.5:4b"
+    openclaw_fallback_models:
+      - "ollama/qwen3.5:2b"
+    openclaw_enable_all_bundled_plugins: false
+    openclaw_plugin_allowlist:
+      - browser
+      - file-transfer
+      - nextcloud-talk
+    openclaw_skills_prefer_brew: true
+    openclaw_skills_node_manager: "npm"
+    openclaw_obsidian_vault_host_path: "/home/{{ local_login_user }}/Documents/obsidian"
+    openclaw_node_host_enabled: true
+    openclaw_node_host_package: "openclaw@2026.5.28"
+    openclaw_node_host_display_name: "{{ ansible_hostname }}-host"
+    openclaw_node_host_home: "/home/{{ local_login_user }}/.openclaw-host-node"
+    openclaw_node_host_systemd_dir: "/home/{{ local_login_user }}/.config/systemd/user"
+    openclaw_node_host_allowed_commands:
+      - system.run.prepare
+      - system.run
+      - system.which
+      - system.execApprovals.get
+      - system.execApprovals.set
+    openclaw_node_host_exec_approvals:
+      version: 1
+      defaults:
+        security: full
+        ask: off
+        askFallback: full
+      agents: {}
+    openclaw_tailscale_container_name: openclaw-ts
+    openclaw_tailscale_hostname: >-
+      {{ ('openclaw-' ~ ansible_hostname) | lower | regex_replace('[^a-z0-9-]', '-') }}
+    openclaw_tailscale_authkey: ""
+    openclaw_tailscale_authkey_effective: >-
+      {{
+        openclaw_tailscale_authkey ~ '?ephemeral=false&preauthorized=true'
+        if (
+          openclaw_tailscale_authkey is match('^tskey-client-')
+          and ('?' not in openclaw_tailscale_authkey)
+        )
+        else openclaw_tailscale_authkey
+      }}
+    openclaw_tailscale_advertise_tags:
+      - tag:container
+    openclaw_tailscale_extra_args: >-
+      {{
+        (
+          (
+            ['--advertise-tags=' ~ (openclaw_tailscale_advertise_tags | join(','))]
+            if (openclaw_tailscale_advertise_tags | length > 0)
+            else []
+          )
+          + ['--timeout=' ~ tailscale_sidecar_up_timeout]
+        ) | join(' ')
+      }}
+    openclaw_tailscale_state_dir: "{{ tailscale_services_root }}/openclaw"
+    openclaw_tailscale_https_port: 443
+    openclaw_tailscale_webhook_https_port: 8443
+    openclaw_nextcloud_talk_webhook_host: "0.0.0.0"
+    openclaw_nextcloud_talk_webhook_port: 8788
+    openclaw_nextcloud_talk_webhook_path: "/nextcloud-talk-webhook"
+    openclaw_nextcloud_talk_bot_name: "OpenClaw"
+
+    nextcloud_container_name: nextcloud-aio-nextcloud
+    nextcloud_aio_mastercontainer_name: nextcloud-aio-mastercontainer
+    nextcloud_aio_mastercontainer_image: ghcr.io/nextcloud-releases/all-in-one:latest
+    nextcloud_aio_docker_api_version: "1.44"
+    nextcloud_aio_interface_port: 8080
+    nextcloud_aio_apache_port: 11000
+    nextcloud_aio_apache_ip_binding: 127.0.0.1
+    nextcloud_occ_path: /var/www/html/occ
+    nextcloud_admin_user: "{{ local_login_user }}"
+    nextcloud_tailscale_container_name: nextcloud-ts
+    nextcloud_tailscale_hostname: >-
+      {{ ('nextcloud-' ~ ansible_hostname) | lower | regex_replace('[^a-z0-9-]', '-') }}
+    nextcloud_tailscale_authkey: ""
+    nextcloud_tailscale_authkey_effective: >-
+      {{
+        nextcloud_tailscale_authkey ~ '?ephemeral=false&preauthorized=true'
+        if (
+          nextcloud_tailscale_authkey is match('^tskey-client-')
+          and ('?' not in nextcloud_tailscale_authkey)
+        )
+        else nextcloud_tailscale_authkey
+      }}
+    nextcloud_tailscale_advertise_tags:
+      - tag:container
+    nextcloud_tailscale_extra_args: >-
+      {{
+        (
+          (
+            ['--advertise-tags=' ~ (nextcloud_tailscale_advertise_tags | join(','))]
+            if (nextcloud_tailscale_advertise_tags | length > 0)
+            else []
+          )
+          + ['--timeout=' ~ tailscale_sidecar_up_timeout]
+        ) | join(' ')
+      }}
+    nextcloud_tailscale_state_dir: "{{ tailscale_services_root }}/nextcloud"
+    nextcloud_tailscale_https_port: 443
+    nextcloud_major_version: "33"
+    nextcloud_talk_app_id: spreed
+    nextcloud_talk_release_version_map:
+      "32": "22.0.12"
+      "33": "23.0.1"
+    nextcloud_talk_release_version: >-
+      {{
+        nextcloud_talk_release_version_map[nextcloud_major_version]
+        | default('22.0.12')
+      }}
+    nextcloud_talk_release_archive: "/tmp/{{ nextcloud_talk_app_id }}-v{{ nextcloud_talk_release_version }}.tar.gz"
+    nextcloud_talk_release_url: >-
+      https://github.com/nextcloud-releases/{{ nextcloud_talk_app_id }}/releases/download/v{{ nextcloud_talk_release_version }}/{{ nextcloud_talk_app_id }}-v{{ nextcloud_talk_release_version }}.tar.gz
+    nextcloud_talk_room_token: ""
+    nextcloud_talk_room_token_from_bitwarden: true
+    nextcloud_talk_room_require_mention: false
+    nextcloud_talk_allow_private_network: true
+    nextcloud_talk_dm_policy: "open"
+    nextcloud_talk_allow_from:
+      - "*"
+    nextcloud_talk_group_policy: "open"
+    nextcloud_talk_enable_room_lookups: true
+    nextcloud_talk_api_user: "craig"
+    nextcloud_talk_api_password_use_admin_password: false
+    nextcloud_talk_bot_description: "OpenClaw bot for Nextcloud Talk"
+    nextcloud_allow_unstable_apps: true
+
+    # Bitwarden selectors may be vault item names or UUIDs.
+    # For UUIDs, set the matching *_search variable to "id".
+    bitwarden_tailscale_authkey_item: "tailscale-fedora44-authkey"
+    bitwarden_tailscale_authkey_search: "name"
+    bitwarden_tailscale_authkey_field: "password"
+    bitwarden_openclaw_tailscale_authkey_item: "tailscale-openclaw-authkey"
+    bitwarden_openclaw_tailscale_authkey_search: "name"
+    bitwarden_openclaw_tailscale_authkey_field: "password"
+    bitwarden_nextcloud_tailscale_authkey_item: "tailscale-nextcloud-authkey"
+    bitwarden_nextcloud_tailscale_authkey_search: "name"
+    bitwarden_nextcloud_tailscale_authkey_field: "password"
+
+    bitwarden_openclaw_gateway_token_item: "openclaw-gateway-token"
+    bitwarden_openclaw_gateway_token_search: "name"
+    bitwarden_openclaw_gateway_token_field: "password"
+
+    bitwarden_nextcloud_admin_password_item: "nextcloud-admin-password"
+    bitwarden_nextcloud_admin_password_search: "name"
+    bitwarden_nextcloud_admin_password_field: "password"
+
+    bitwarden_nextcloud_aio_passphrase_item: "nextcloud-aio-passphrase"
+    bitwarden_nextcloud_aio_passphrase_search: "name"
+    bitwarden_nextcloud_aio_passphrase_field: "password"
+
+    bitwarden_nextcloud_db_password_item: "nextcloud-postgres-password"
+    bitwarden_nextcloud_db_password_search: "name"
+    bitwarden_nextcloud_db_password_field: "password"
+
+    bitwarden_nextcloud_talk_bot_secret_item: "nextcloud-talk-bot-secret"
+    bitwarden_nextcloud_talk_bot_secret_search: "name"
+    bitwarden_nextcloud_talk_bot_secret_field: "password"
+
+    bitwarden_nextcloud_talk_api_password_item: "nextcloud-talk-api-password"
+    bitwarden_nextcloud_talk_api_password_search: "name"
+    bitwarden_nextcloud_talk_api_password_field: "password"
+
+    bitwarden_nextcloud_talk_room_token_item: "nextcloud-talk-room-token"
+    bitwarden_nextcloud_talk_room_token_search: "name"
+    bitwarden_nextcloud_talk_room_token_field: "password"
+  vars_prompt:
+    - name: bw_user
+      prompt: "Enter your Bitwarden user name"
+      private: false
+
+    - name: bw_pass
+      prompt: "Enter your Bitwarden password"
+      private: true
+
+  pre_tasks:
+    - name: Assert Fedora 44 is the target OS
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Fedora"
+          - ansible_distribution_major_version | int == fedora_release_major
+        fail_msg: >-
+          This playbook is written for Fedora {{ fedora_release_major }}. Detected
+          {{ ansible_distribution }} {{ ansible_distribution_version }}.
+
+    - name: Install Bitwarden CLI Client
+      ansible.builtin.unarchive:
+        src: https://bitwarden.com/download/?app=cli&platform=linux
+        dest: /usr/local/bin
+        remote_src: true
+        creates: /usr/local/bin/bw
+        mode: "u=rwx,g=rx,o=rx"
+
+    - name: Get Bitwarden Login status
+      ansible.builtin.command:
+        argv:
+          - bw
+          - status
+      register: bw_status_raw
+      become: false
+      changed_when: false
+
+    - name: Expand Bitwarden status result
+      ansible.builtin.set_fact:
+        bw_status: "{{ bw_status_raw.stdout | ansible.builtin.from_json }}"
+      become: false
+
+    - name: Log out Bitwarden
+      ansible.builtin.command:
+        argv:
+          - bw
+          - logout
+      when: bw_status.status != "unauthenticated"
+      become: false
+      register: bw_status_raw
+      changed_when: bw_status_raw.rc == 0
+
+    - name: Login to Bitwarden
+      ansible.builtin.command:
+        argv:
+          - bw
+          - login
+          - --raw
+          - "{{ bw_user }}"
+          - "{{ bw_pass }}"
+      register: bwsessionid
+      become: false
+      changed_when: false
+
+    - name: Sync Bitwarden once for the playbook run
+      ansible.builtin.command:
+        argv:
+          - bw
+          - --session
+          - "{{ bwsessionid.stdout }}"
+          - sync
+      become: false
+      changed_when: false
+      no_log: true
+
+    - name: Resolve secrets from Bitwarden
+      ansible.builtin.set_fact:
+        tailscale_authkey: >-
+          {{
+            lookup(
+              'community.general.bitwarden',
+              bitwarden_tailscale_authkey_item,
+              search=bitwarden_tailscale_authkey_search,
+              field=bitwarden_tailscale_authkey_field,
+              bw_session=bwsessionid.stdout
+            ) | first
+          }}
+        openclaw_tailscale_authkey: >-
+          {{
+            lookup(
+              'community.general.bitwarden',
+              bitwarden_openclaw_tailscale_authkey_item,
+              search=bitwarden_openclaw_tailscale_authkey_search,
+              field=bitwarden_openclaw_tailscale_authkey_field,
+              bw_session=bwsessionid.stdout
+            ) | first
+          }}
+        nextcloud_tailscale_authkey: >-
+          {{
+            lookup(
+              'community.general.bitwarden',
+              bitwarden_nextcloud_tailscale_authkey_item,
+              search=bitwarden_nextcloud_tailscale_authkey_search,
+              field=bitwarden_nextcloud_tailscale_authkey_field,
+              bw_session=bwsessionid.stdout
+            ) | first
+          }}
+        openclaw_gateway_token: >-
+          {{
+            lookup(
+              'community.general.bitwarden',
+              bitwarden_openclaw_gateway_token_item,
+              search=bitwarden_openclaw_gateway_token_search,
+              field=bitwarden_openclaw_gateway_token_field,
+              bw_session=bwsessionid.stdout
+            ) | first
+          }}
+        nextcloud_admin_password: >-
+          {{
+            lookup(
+              'community.general.bitwarden',
+              bitwarden_nextcloud_admin_password_item,
+              search=bitwarden_nextcloud_admin_password_search,
+              field=bitwarden_nextcloud_admin_password_field,
+              bw_session=bwsessionid.stdout
+            ) | first
+          }}
+        nextcloud_aio_passphrase: >-
+          {{
+            lookup(
+              'community.general.bitwarden',
+              bitwarden_nextcloud_aio_passphrase_item,
+              search=bitwarden_nextcloud_aio_passphrase_search,
+              field=bitwarden_nextcloud_aio_passphrase_field,
+              bw_session=bwsessionid.stdout
+            ) | first
+          }}
+        nextcloud_db_password: >-
+          {{
+            lookup(
+              'community.general.bitwarden',
+              bitwarden_nextcloud_db_password_item,
+              search=bitwarden_nextcloud_db_password_search,
+              field=bitwarden_nextcloud_db_password_field,
+              bw_session=bwsessionid.stdout
+            ) | first
+          }}
+        nextcloud_talk_bot_secret: >-
+          {{
+            lookup(
+              'community.general.bitwarden',
+              bitwarden_nextcloud_talk_bot_secret_item,
+              search=bitwarden_nextcloud_talk_bot_secret_search,
+              field=bitwarden_nextcloud_talk_bot_secret_field,
+              bw_session=bwsessionid.stdout
+            ) | first
+          }}
+        nextcloud_talk_api_password: >-
+          {{
+            ''
+            if not nextcloud_talk_enable_room_lookups
+            else
+            (
+              lookup(
+                'community.general.bitwarden',
+                bitwarden_nextcloud_admin_password_item,
+                search=bitwarden_nextcloud_admin_password_search,
+                field=bitwarden_nextcloud_admin_password_field,
+                bw_session=bwsessionid.stdout
+              ) | first
+            )
+            if nextcloud_talk_api_password_use_admin_password
+            else (
+              lookup(
+                'community.general.bitwarden',
+                bitwarden_nextcloud_talk_api_password_item,
+                search=bitwarden_nextcloud_talk_api_password_search,
+                field=bitwarden_nextcloud_talk_api_password_field,
+                bw_session=bwsessionid.stdout
+              ) | first
+            )
+          }}
+        resolved_nextcloud_talk_room_token: >-
+          {{
+            (
+              lookup(
+                'community.general.bitwarden',
+                bitwarden_nextcloud_talk_room_token_item,
+                search=bitwarden_nextcloud_talk_room_token_search,
+                field=bitwarden_nextcloud_talk_room_token_field,
+                bw_session=bwsessionid.stdout
+              ) | first
+            )
+            if nextcloud_talk_room_token_from_bitwarden
+            else nextcloud_talk_room_token
+          }}
+      no_log: true
+      become: false
+
+    - name: Assert dedicated Tailscale sidecar auth keys were resolved
+      ansible.builtin.assert:
+        that:
+          - tailscale_authkey | length > 0
+          - openclaw_tailscale_authkey | length > 0
+          - nextcloud_tailscale_authkey | length > 0
+        fail_msg: >-
+          The playbook now expects three Tailscale auth keys from Bitwarden:
+          one for the host node (`{{ bitwarden_tailscale_authkey_item }}`),
+          one for OpenClaw (`{{ bitwarden_openclaw_tailscale_authkey_item }}`),
+          and one for Nextcloud (`{{ bitwarden_nextcloud_tailscale_authkey_item }}`).
+          Service sidecars need their own reusable or preauthorized auth keys.
+      no_log: true
+      become: false
+
+    - name: Assert the Nextcloud AIO passphrase was resolved
+      ansible.builtin.assert:
+        that:
+          - nextcloud_aio_passphrase | length > 0
+        fail_msg: >-
+          The Nextcloud AIO passphrase could not be resolved from Bitwarden item
+          `{{ bitwarden_nextcloud_aio_passphrase_item }}`.
+      no_log: true
+      become: false
+
+  tasks:
+    - name: Update Fedora and install base packages
+      ansible.builtin.dnf:
+        name: "{{ system_base_packages }}"
+        state: present
+        update_cache: true
+
+    - name: Upgrade all installed packages
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+
+    - name: Enable and start firewalld
+      ansible.builtin.systemd_service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Configure firewalld to use the iptables backend for Docker
+      ansible.builtin.lineinfile:
+        path: /etc/firewalld/firewalld.conf
+        regexp: "^#?FirewallBackend="
+        line: "FirewallBackend={{ firewalld_backend }}"
+      register: firewalld_backend_config
+
+    - name: Restart firewalld after backend changes
+      ansible.builtin.systemd_service:
+        name: firewalld
+        state: restarted
+      when: firewalld_backend_config.changed
+
+    - name: Persist IPv4 forwarding for container egress
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ai-services.conf
+        mode: "0644"
+        content: |
+          net.ipv4.ip_forward=1
+
+    - name: Apply IPv4 forwarding for the current boot
+      ansible.builtin.command:
+        argv:
+          - sysctl
+          - -w
+          - net.ipv4.ip_forward=1
+      changed_when: false
+
+    - name: Detect NVIDIA PCI devices
+      ansible.builtin.command:
+        argv:
+          - lspci
+          - -Dnn
+          - -d
+          - "10de:"
+      register: nvidia_lspci_raw
+      changed_when: false
+
+    - name: Extract the discrete NVIDIA GPU line
+      ansible.builtin.set_fact:
+        nvidia_gpu_line: >-
+          {{
+            nvidia_lspci_raw.stdout_lines
+            | select('search', 'VGA compatible controller|3D controller|Display controller')
+            | list
+            | first
+            | default('')
+          }}
+
+    - name: Cache whether an NVIDIA GPU was detected
+      ansible.builtin.set_fact:
+        has_nvidia_gpu: "{{ nvidia_gpu_line | length > 0 }}"
+
+    - name: Report NVIDIA GPU detection result
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'Detected NVIDIA GPU candidate: ' ~ nvidia_gpu_line
+            if has_nvidia_gpu
+            else 'No NVIDIA GPU was detected by lspci; NVIDIA driver and toolkit tasks will be skipped and Ollama will run without a GPU device.'
+          }}
+
+    - name: Parse the NVIDIA GPU model name
+      ansible.builtin.set_fact:
+        nvidia_gpu_model: >-
+          {{
+            nvidia_gpu_line
+            | regex_replace('^.*NVIDIA Corporation ', '')
+            | regex_replace(' \\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\\]$', '')
+            | trim
+          }}
+        nvidia_gpu_device_id: >-
+          {{
+            (
+              (nvidia_gpu_line | regex_replace('^.*\\[10de:([0-9a-fA-F]{4})\\].*$', '\\1'))
+              if (nvidia_gpu_line is search('\\[10de:[0-9a-fA-F]{4}\\]'))
+              else ''
+            ) | lower
+          }}
+      when: has_nvidia_gpu
+
+    - name: Set default NVIDIA facts when no GPU is present
+      ansible.builtin.set_fact:
+        nvidia_gpu_model: "not-detected"
+        nvidia_driver_branch: "not-applicable"
+      when: not has_nvidia_gpu
+
+    - name: Choose the RPM Fusion NVIDIA driver branch
+      ansible.builtin.set_fact:
+        nvidia_driver_branch: >-
+          {{
+            nvidia_force_driver_branch
+            if nvidia_force_driver_branch | length > 0
+            else nvidia_legacy_device_id_map[nvidia_gpu_device_id]
+            if nvidia_gpu_device_id in nvidia_legacy_device_id_map
+            else '580xx'
+            if (
+              nvidia_gpu_model is search('(?i)GeForce GTX 9[0-9]{2}M')
+              or nvidia_gpu_model is search('(?i)Quadro M[0-9]{3,4}')
+              or nvidia_gpu_model is search('(?i)Tesla M[0-9]{2,3}')
+            )
+            else 'latest'
+          }}
+      when: has_nvidia_gpu
+
+    - name: Gather installed package facts before NVIDIA reconciliation
+      ansible.builtin.package_facts:
+        manager: auto
+      when: has_nvidia_gpu
+
+    - name: Enable RPM Fusion free and nonfree repositories
+      ansible.builtin.dnf:
+        name:
+          - "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-{{ fedora_release_major }}.noarch.rpm"
+          - "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{{ fedora_release_major }}.noarch.rpm"
+        state: present
+        disable_gpg_check: false
+      when: has_nvidia_gpu
+
+    - name: Check whether the selected NVIDIA core driver packages are already installed
+      ansible.builtin.set_fact:
+        nvidia_driver_core_packages_installed: >-
+          {{
+            (nvidia_core_package_map[nvidia_driver_branch] | difference(ansible_facts.packages.keys() | list)) | length == 0
+          }}
+      when: has_nvidia_gpu
+
+    - name: Check whether the NVIDIA kernel module exists for the running kernel
+      ansible.builtin.command:
+        argv:
+          - modinfo
+          - -k
+          - "{{ ansible_facts['kernel'] }}"
+          - nvidia
+      register: nvidia_modinfo_preflight
+      changed_when: false
+      failed_when: false
+      when: has_nvidia_gpu
+
+    - name: Check whether the NVIDIA kernel module is already loaded
+      ansible.builtin.command:
+        argv:
+          - lsmod
+      register: nvidia_lsmod
+      changed_when: false
+      when: has_nvidia_gpu
+
+    - name: Check whether NVIDIA is already functional with nvidia-smi
+      ansible.builtin.command:
+        argv:
+          - nvidia-smi
+          - -L
+      register: nvidia_smi_preflight
+      changed_when: false
+      failed_when: false
+      when: has_nvidia_gpu
+
+    - name: Check whether selected NVIDIA driver packages have pending updates
+      ansible.builtin.command:
+        cmd: "dnf -q check-update {{ nvidia_package_map[nvidia_driver_branch] | join(' ') }}"
+      register: nvidia_driver_updates_check
+      changed_when: false
+      failed_when: nvidia_driver_updates_check.rc not in [0, 100]
+      when:
+        - has_nvidia_gpu
+        - nvidia_driver_core_packages_installed | default(false)
+
+    - name: Cache whether the NVIDIA driver is already loaded and current
+      ansible.builtin.set_fact:
+        nvidia_driver_ready: >-
+          {{
+            has_nvidia_gpu
+            and (nvidia_driver_core_packages_installed | default(false))
+            and (nvidia_modinfo_preflight.rc | default(1) == 0)
+            and (nvidia_smi_preflight.rc | default(1) == 0)
+            and (nvidia_driver_updates_check.rc | default(100) == 0)
+          }}
+      when: has_nvidia_gpu
+
+    - name: Report NVIDIA driver readiness
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'NVIDIA driver is already loaded, healthy, and current for branch ' ~ nvidia_driver_branch ~ '; skipping driver reinstall and akmods rebuild.'
+            if (nvidia_driver_ready | default(false))
+            else 'NVIDIA driver reconciliation is required for branch ' ~ nvidia_driver_branch
+            ~ ' (core_packages=' ~ ((nvidia_driver_core_packages_installed | default(false)) | string)
+            ~ ', modinfo=' ~ ((nvidia_modinfo_preflight.rc | default(1) == 0) | string)
+            ~ ', lsmod=' ~ (((nvidia_lsmod.stdout is search("(?m)^nvidia\\\\s")) or (nvidia_lsmod.stdout is search("(?m)^nvidia_drm\\\\s"))) | string)
+            ~ ', nvidia_smi=' ~ ((nvidia_smi_preflight.rc | default(1) == 0) | string)
+            ~ ', updates_pending=' ~ ((nvidia_driver_updates_check.rc | default(100) == 100) | string)
+            ~ ').'
+          }}
+      when: has_nvidia_gpu
+
+    - name: Remove conflicting non-580xx NVIDIA packages when using the 580xx branch
+      ansible.builtin.dnf:
+        name:
+          - akmod-nvidia
+          - "kmod-nvidia-*"
+          - nvidia-kmod-common
+          - xorg-x11-drv-nvidia
+          - xorg-x11-drv-nvidia-cuda
+          - xorg-x11-drv-nvidia-cuda-libs
+          - xorg-x11-drv-nvidia-kmodsrc
+          - xorg-x11-drv-nvidia-libs
+          - xorg-x11-drv-nvidia-power
+          - nvidia-settings
+          - nvidia-persistenced
+        state: absent
+        autoremove: true
+        allowerasing: true
+      when:
+        - has_nvidia_gpu
+        - nvidia_driver_branch == '580xx'
+        - not (nvidia_driver_ready | default(false))
+
+    - name: Remove conflicting 580xx NVIDIA packages when using the latest branch
+      ansible.builtin.dnf:
+        name:
+          - akmod-nvidia-580xx
+          - "kmod-nvidia-580xx*"
+          - nvidia-settings-580xx
+          - xorg-x11-drv-nvidia-580xx
+          - xorg-x11-drv-nvidia-580xx-cuda
+          - xorg-x11-drv-nvidia-580xx-cuda-libs
+          - xorg-x11-drv-nvidia-580xx-kmodsrc
+          - xorg-x11-drv-nvidia-580xx-libs
+        state: absent
+        autoremove: true
+        allowerasing: true
+      when:
+        - has_nvidia_gpu
+        - nvidia_driver_branch == 'latest'
+        - not (nvidia_driver_ready | default(false))
+
+    - name: Install kernel build prerequisites for akmods
+      ansible.builtin.dnf:
+        name:
+          - kernel-devel-matched
+          - kernel-headers
+          - akmods
+          - gcc
+          - make
+          - elfutils-libelf-devel
+        state: present
+        disable_excludes: all
+      when:
+        - has_nvidia_gpu
+        - not (nvidia_driver_ready | default(false))
+
+    - name: Install the selected proprietary NVIDIA driver branch
+      ansible.builtin.dnf:
+        name: "{{ nvidia_package_map[nvidia_driver_branch] }}"
+        state: present
+        allowerasing: true
+      register: nvidia_driver_install
+      when:
+        - has_nvidia_gpu
+        - not (nvidia_driver_ready | default(false))
+
+    - name: Build akmods for the running kernel
+      ansible.builtin.command:
+        argv:
+          - akmods
+          - --force
+          - --rebuild
+          - --kernels
+          - "{{ ansible_facts['kernel'] }}"
+      register: nvidia_akmods_build
+      changed_when: true
+      when:
+        - has_nvidia_gpu
+        - not (nvidia_driver_ready | default(false))
+
+    - name: Wait until the NVIDIA kernel module is available for the running kernel
+      ansible.builtin.command:
+        argv:
+          - modinfo
+          - -k
+          - "{{ ansible_facts['kernel'] }}"
+          - nvidia
+      register: nvidia_modinfo
+      changed_when: false
+      until: nvidia_modinfo.rc == 0
+      retries: 30
+      delay: 20
+      when:
+        - has_nvidia_gpu
+        - not (nvidia_driver_ready | default(false))
+
+    - name: Load the NVIDIA kernel module
+      ansible.builtin.command:
+        argv:
+          - modprobe
+          - nvidia
+      register: modprobe_nvidia
+      changed_when: modprobe_nvidia.rc == 0
+      failed_when: false
+      when:
+        - has_nvidia_gpu
+        - not (nvidia_driver_ready | default(false))
+
+    - name: Validate NVIDIA with nvidia-smi before deciding on a reboot
+      ansible.builtin.command:
+        argv:
+          - nvidia-smi
+          - -L
+      register: nvidia_smi_pre_reboot
+      changed_when: false
+      failed_when: false
+      when: has_nvidia_gpu
+
+    - name: Reboot if the NVIDIA driver was installed but is not yet active
+      ansible.builtin.reboot:
+        msg: "Rebooting to activate the proprietary NVIDIA driver"
+        reboot_timeout: 1800
+      when:
+        - has_nvidia_gpu
+        - reboot_if_required_for_nvidia
+        - nvidia_driver_install.changed | default(false)
+        - nvidia_smi_pre_reboot.rc != 0
+
+    - name: Validate NVIDIA after installation
+      ansible.builtin.command:
+        argv:
+          - nvidia-smi
+          - -L
+      register: nvidia_smi_final
+      changed_when: false
+      when: has_nvidia_gpu
+
+    - name: Configure the NVIDIA container toolkit repository
+      ansible.builtin.get_url:
+        url: https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo
+        dest: /etc/yum.repos.d/nvidia-container-toolkit.repo
+        mode: "0644"
+      when: has_nvidia_gpu
+
+    - name: Install the NVIDIA container toolkit
+      ansible.builtin.dnf:
+        name:
+          - nvidia-container-toolkit
+        state: present
+      register: nvidia_container_toolkit_install
+      when: has_nvidia_gpu
+
+    - name: Remove conflicting Docker packages before installing Docker CE
+      ansible.builtin.dnf:
+        name: "{{ docker_conflicting_packages }}"
+        state: absent
+      failed_when: false
+
+    - name: Install the Docker CE repository definition
+      ansible.builtin.get_url:
+        url: "{{ docker_repo_url }}"
+        dest: "{{ docker_repo_file }}"
+        mode: "0644"
+
+    - name: Install Docker Engine packages
+      ansible.builtin.dnf:
+        name: "{{ docker_packages }}"
+        state: present
+
+    - name: Install the Docker Python SDK for Ansible modules
+      ansible.builtin.pip:
+        name: docker
+        state: present
+
+    - name: Configure Docker to use the NVIDIA runtime
+      ansible.builtin.command:
+        argv:
+          - nvidia-ctk
+          - runtime
+          - configure
+          - --runtime=docker
+      register: nvidia_docker_runtime_config
+      changed_when: "'wrote updated config' in ((nvidia_docker_runtime_config.stdout | default('')) | lower)"
+      when: has_nvidia_gpu
+
+    - name: Enable and start Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Restart Docker after NVIDIA runtime changes
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+      when: has_nvidia_gpu and (nvidia_docker_runtime_config.changed | default(false))
+
+    - name: Discover the Docker bridge gateway IP
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - bridge
+          - --format
+          - "{{ '{{ (index .IPAM.Config 0).Gateway }}' }}"
+      register: docker_bridge_gateway_ip_raw
+      changed_when: false
+
+    - name: Cache the Docker bridge gateway IP
+      ansible.builtin.set_fact:
+        docker_bridge_gateway_ip: "{{ docker_bridge_gateway_ip_raw.stdout | trim }}"
+
+    - name: Assert the Docker bridge gateway IP was discovered
+      ansible.builtin.assert:
+        that:
+          - docker_bridge_gateway_ip | length > 0
+        fail_msg: >-
+          Docker is running, but the playbook could not determine the bridge
+          gateway IP from `docker network inspect bridge`.
+
+    - name: Ensure the shared Docker network for local AI services exists
+      community.docker.docker_network:
+        name: "{{ ai_services_docker_network_name }}"
+        state: present
+
+    - name: Discover the shared AI services Docker network gateway IP
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - "{{ ai_services_docker_network_name }}"
+          - --format
+          - "{{ '{{ (index .IPAM.Config 0).Gateway }}' }}"
+      register: ai_services_docker_gateway_ip_raw
+      changed_when: false
+
+    - name: Cache the shared AI services Docker network gateway IP
+      ansible.builtin.set_fact:
+        ai_services_docker_gateway_ip: "{{ ai_services_docker_gateway_ip_raw.stdout | trim }}"
+
+    - name: Assert the shared AI services Docker network gateway IP was discovered
+      ansible.builtin.assert:
+        that:
+          - ai_services_docker_gateway_ip | length > 0
+        fail_msg: >-
+          Docker is running, but the playbook could not determine the
+          `{{ ai_services_docker_network_name }}` gateway IP from
+          `docker network inspect {{ ai_services_docker_network_name }}`.
+
+    - name: Configure the Tailscale package repository
+      ansible.builtin.yum_repository:
+        name: tailscale-stable
+        description: Tailscale stable
+        baseurl: "{{ tailscale_repo_baseurl }}"
+        gpgcheck: true
+        repo_gpgcheck: true
+        gpgkey: "{{ tailscale_repo_gpgkey }}"
+        enabled: true
+
+    - name: Install Tailscale
+      ansible.builtin.dnf:
+        name: tailscale
+        state: present
+
+    - name: Enable and start tailscaled
+      ansible.builtin.systemd_service:
+        name: tailscaled
+        state: started
+        enabled: true
+
+    - name: Read the current Tailscale status
+      ansible.builtin.command:
+        argv:
+          - tailscale
+          - status
+          - --json
+      register: tailscale_status_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Parse Tailscale status
+      ansible.builtin.set_fact:
+        tailscale_status: "{{ tailscale_status_raw.stdout | default('{}') | from_json }}"
+      when: tailscale_status_raw.rc == 0
+
+    - name: Bring the device onto the tailnet
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [
+              'tailscale',
+              'up',
+              '--authkey=' ~ tailscale_authkey,
+              '--reset'
+            ]
+            + (['--accept-routes'] if tailscale_accept_routes else [])
+            + (['--accept-dns=' ~ ('true' if tailscale_accept_dns else 'false')])
+            + (['--ssh'] if tailscale_enable_ssh else [])
+            + tailscale_extra_up_flags
+          }}
+      register: tailscale_up
+      when: not (((tailscale_status.Self | default({})).Online) | default(false))
+      changed_when: true
+      no_log: true
+
+    - name: Wait for Tailscale to report the current node identity
+      ansible.builtin.command:
+        argv:
+          - tailscale
+          - status
+          - --json
+      register: tailscale_status_confirm_raw
+      changed_when: false
+      retries: 30
+      delay: 5
+      until: >-
+        tailscale_status_confirm_raw.rc == 0
+        and (
+          (
+            tailscale_status_confirm_raw.stdout
+            | from_json
+          ).Self.Online | default(false)
+        )
+        and (
+          (
+            (
+              tailscale_status_confirm_raw.stdout
+              | from_json
+            ).Self.TailscaleIPs | default([])
+          )
+          | select('match', '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$')
+          | list
+          | length
+        ) > 0
+
+    - name: Gather the current host Tailscale IPv4 as a fallback
+      ansible.builtin.command:
+        argv:
+          - tailscale
+          - ip
+          - -4
+      register: tailscale_ipv4_fallback_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Cache Tailscale addressing facts
+      ansible.builtin.set_fact:
+        tailscale_ipv4: >-
+          {{
+            (
+              (
+                (
+                  (
+                    tailscale_status_confirm_raw.stdout
+                    | from_json
+                  ).Self.TailscaleIPs | default([])
+                )
+                | select('match', '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$')
+                | list
+                | first
+                | default('')
+              )
+              if (
+                (
+                  (
+                    tailscale_status_confirm_raw.stdout
+                    | from_json
+                  ).Self.TailscaleIPs | default([])
+                )
+                | select('match', '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$')
+                | list
+                | length
+              ) > 0
+              else (
+                tailscale_ipv4_fallback_raw.stdout_lines
+                | default([])
+                | select('match', '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$')
+                | list
+                | first
+                | default('')
+              )
+            )
+          }}
+        tailscale_dns_name: >-
+          {{
+            (
+              tailscale_status_confirm_raw.stdout
+              | from_json
+            ).Self.DNSName | default('') | trim | regex_replace('[.]$', '')
+          }}
+        tailscale_magicdns_suffix: >-
+          {{
+            (
+              tailscale_status_confirm_raw.stdout
+              | from_json
+            ).MagicDNSSuffix | default('') | trim | regex_replace('[.]$', '')
+          }}
+
+    - name: Predict per-service Tailscale DNS names and URLs from the host tailnet
+      ansible.builtin.set_fact:
+        openclaw_tailscale_dns_name_expected: >-
+          {{
+            (
+              openclaw_tailscale_hostname ~ '.' ~ (tailscale_magicdns_suffix | regex_replace('[.]$', ''))
+            )
+            if (tailscale_magicdns_suffix | default('') | length > 0)
+            else openclaw_tailscale_hostname
+          }}
+        nextcloud_tailscale_dns_name_expected: >-
+          {{
+            (
+              nextcloud_tailscale_hostname ~ '.' ~ (tailscale_magicdns_suffix | regex_replace('[.]$', ''))
+            )
+            if (tailscale_magicdns_suffix | default('') | length > 0)
+            else nextcloud_tailscale_hostname
+          }}
+        openclaw_tailscale_url_expected: >-
+          https://{{
+            (
+              openclaw_tailscale_hostname ~ '.' ~ (tailscale_magicdns_suffix | regex_replace('[.]$', ''))
+            )
+            if (tailscale_magicdns_suffix | default('') | length > 0)
+            else openclaw_tailscale_hostname
+          }}/
+        openclaw_tailscale_webhook_url_expected: >-
+          https://{{
+            (
+              openclaw_tailscale_hostname ~ '.' ~ (tailscale_magicdns_suffix | regex_replace('[.]$', ''))
+            )
+            if (tailscale_magicdns_suffix | default('') | length > 0)
+            else openclaw_tailscale_hostname
+          }}:{{ openclaw_tailscale_webhook_https_port }}{{ openclaw_nextcloud_talk_webhook_path }}
+        nextcloud_tailscale_url_expected: >-
+          https://{{
+            (
+              nextcloud_tailscale_hostname ~ '.' ~ (tailscale_magicdns_suffix | regex_replace('[.]$', ''))
+            )
+            if (tailscale_magicdns_suffix | default('') | length > 0)
+            else nextcloud_tailscale_hostname
+          }}/
+
+    - name: Report the current Tailscale node address
+      ansible.builtin.debug:
+        msg: >-
+          Tailscale reports this host node as {{ tailscale_dns_name | default('unknown') }}
+          at {{ tailscale_ipv4 | default('unavailable') if (tailscale_ipv4 | default('') | length > 0) else 'unavailable' }}.
+
+    - name: Create container service directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner | default('root') }}"
+        group: "{{ item.group | default('root') }}"
+        mode: "{{ item.mode | default('0750') }}"
+      loop:
+        - { path: "{{ containers_root }}" }
+        - { path: "{{ tailscale_services_root }}" }
+        - { path: "{{ openclaw_tailscale_state_dir }}" }
+        - { path: "{{ nextcloud_tailscale_state_dir }}" }
+        - { path: "{{ ollama_state_dir }}" }
+        - { path: "{{ openclaw_state_dir }}", owner: "1000", group: "1000", mode: "0750" }
+        - { path: "{{ openclaw_workspace_dir }}", owner: "1000", group: "1000", mode: "0750" }
+        - { path: "{{ openclaw_workspace_dir }}/memory", owner: "1000", group: "1000", mode: "0750" }
+        - { path: "{{ openclaw_workspace_dir }}/skills", owner: "1000", group: "1000", mode: "0750" }
+        - { path: "{{ openclaw_config_dir }}", owner: "1000", group: "1000", mode: "0750" }
+        - { path: "{{ openclaw_secrets_dir }}", owner: "1000", group: "1000", mode: "0750" }
+    - name: Stop legacy Podman systemd units
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - container-ollama.service
+        - container-nextcloud-postgres.service
+        - container-nextcloud-redis.service
+        - pod-openclaw-pod.service
+        - pod-nextcloud-pod.service
+      failed_when: false
+
+    - name: Remove legacy Podman systemd unit files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/container-ollama.service
+        - /etc/systemd/system/container-nextcloud-postgres.service
+        - /etc/systemd/system/container-nextcloud-redis.service
+        - /etc/systemd/system/pod-openclaw-pod.service
+        - /etc/systemd/system/pod-nextcloud-pod.service
+
+    - name: Reload systemd after removing legacy Podman unit files
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Remove legacy Podman pods
+      ansible.builtin.command:
+        argv:
+          - podman
+          - pod
+          - rm
+          - --force
+          - "{{ item }}"
+      register: legacy_podman_pod_removals
+      changed_when: legacy_podman_pod_removals.rc == 0
+      failed_when: false
+      loop:
+        - openclaw-pod
+        - nextcloud-pod
+
+    - name: Remove legacy Podman containers
+      ansible.builtin.command:
+        argv:
+          - podman
+          - rm
+          - --force
+          - "{{ item }}"
+      register: legacy_podman_container_removals
+      changed_when: legacy_podman_container_removals.rc == 0
+      failed_when: false
+      loop:
+        - "{{ ollama_container_name }}"
+        - "{{ openclaw_container_name }}"
+        - "{{ openclaw_tailscale_container_name }}"
+        - "{{ nextcloud_tailscale_container_name }}"
+        - nextcloud
+        - nextcloud-postgres
+        - nextcloud-redis
+
+    - name: Remove the legacy Podman network
+      ansible.builtin.command:
+        argv:
+          - podman
+          - network
+          - rm
+          - "{{ legacy_podman_network_name }}"
+      register: legacy_podman_network_removal
+      changed_when: legacy_podman_network_removal.rc == 0
+      failed_when: false
+
+    - name: Remove the legacy Podman firewall configuration file
+      ansible.builtin.file:
+        path: "{{ podman_netavark_firewall_driver_config_path }}"
+        state: absent
+
+    - name: Check whether the legacy Podman firewalld policy exists
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - --info-policy={{ podman_firewalld_egress_policy_name }}
+      register: legacy_podman_firewalld_policy_info
+      changed_when: false
+      failed_when: false
+
+    - name: Remove the legacy Podman firewalld policy
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - --delete-policy={{ podman_firewalld_egress_policy_name }}
+      register: legacy_podman_firewalld_policy_removal
+      changed_when: true
+      when: legacy_podman_firewalld_policy_info.rc == 0
+
+    - name: Reload firewalld after removing Podman-specific policy state
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --reload
+      changed_when: true
+      when:
+        - legacy_podman_firewalld_policy_removal is defined
+        - legacy_podman_firewalld_policy_removal is changed
+
+    - name: Write the OpenClaw Nextcloud Talk bot secret
+      ansible.builtin.copy:
+        dest: "{{ openclaw_secrets_dir }}/nextcloud-talk-bot-secret"
+        content: "{{ nextcloud_talk_bot_secret }}\n"
+        owner: "1000"
+        group: "1000"
+        mode: "0640"
+      register: openclaw_talk_bot_secret_file
+      no_log: true
+
+    - name: Write the OpenClaw Nextcloud Talk API password
+      ansible.builtin.copy:
+        dest: "{{ openclaw_secrets_dir }}/nextcloud-talk-api-password"
+        content: "{{ nextcloud_talk_api_password }}\n"
+        owner: "1000"
+        group: "1000"
+        mode: "0640"
+      register: openclaw_talk_api_password_file
+      no_log: true
+
+    - name: Check for an existing OpenClaw configuration
+      ansible.builtin.stat:
+        path: "{{ openclaw_config_dir }}/openclaw.json"
+      register: openclaw_existing_config_stat
+
+    - name: Read the existing OpenClaw configuration
+      ansible.builtin.slurp:
+        path: "{{ openclaw_config_dir }}/openclaw.json"
+      register: openclaw_existing_config_raw
+      when: openclaw_existing_config_stat.stat.exists
+
+    - name: Initialize preserved OpenClaw plugin metadata
+      ansible.builtin.set_fact:
+        openclaw_existing_plugin_entries: {}
+        openclaw_existing_plugin_installs: {}
+        openclaw_existing_plugin_load_paths: []
+        openclaw_existing_meta: {}
+
+    - name: Parse the existing OpenClaw configuration
+      ansible.builtin.set_fact:
+        openclaw_existing_config_json: "{{ openclaw_existing_config_raw.content | b64decode | from_json }}"
+      when: openclaw_existing_config_stat.stat.exists
+
+    - name: Preserve machine-managed OpenClaw plugin config
+      ansible.builtin.set_fact:
+        openclaw_existing_plugin_entries: >-
+          {{ ((openclaw_existing_config_json.plugins | default({})).entries | default({})) }}
+        openclaw_existing_plugin_installs: >-
+          {{
+            (
+              ((openclaw_existing_config_json.plugins | default({})).installs | default({}))
+              | dict2items
+              | rejectattr('key', 'equalto', '@openclaw/nextcloud-talk')
+              | items2dict
+            )
+          }}
+        openclaw_existing_plugin_load_paths: >-
+          {{
+            (
+              (((openclaw_existing_config_json.plugins | default({})).load | default({})).paths | default([]))
+              | reject('search', '@openclaw/nextcloud-talk')
+              | list
+            )
+          }}
+        openclaw_existing_meta: "{{ openclaw_existing_config_json.meta | default({}) }}"
+      when:
+        - openclaw_existing_config_stat.stat.exists
+        - openclaw_existing_config_json is mapping
+
+    - name: Remove stale externally installed Nextcloud Talk plugin files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ openclaw_config_dir }}/npm/node_modules/@openclaw/nextcloud-talk"
+        - "{{ openclaw_config_dir }}/npm/node_modules/.bin/nextcloud-talk"
+
+    - name: Ensure the OpenClaw npm plugin directory exists and is writable by node
+      ansible.builtin.file:
+        path: "{{ openclaw_config_dir }}/npm"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0750"
+        recurse: true
+
+    - name: Write the OpenClaw configuration
+      ansible.builtin.copy:
+        dest: "{{ openclaw_config_dir }}/openclaw.json"
+        owner: "1000"
+        group: "1000"
+        mode: "0640"
+        content: |
+          {
+            "gateway": {
+              "mode": "local",
+              "port": {{ openclaw_gateway_port }},
+              "bind": "lan",
+              "trustedProxies": [
+                "{{ docker_bridge_gateway_ip }}",
+                "{{ ai_services_docker_gateway_ip }}"
+              ],
+              "auth": {
+                "mode": "token",
+                "allowTailscale": true
+              },
+              "nodes": {
+                "browser": {
+                  "mode": "auto",
+                  "node": "{{ openclaw_node_host_display_name }}"
+                },
+                "allowCommands": {{ openclaw_node_host_allowed_commands | to_json }}
+              }
+            },
+            "agents": {
+              "defaults": {
+                "workspace": "/workspace",
+                "repoRoot": "/workspace",
+                "bootstrapMaxChars": 4000,
+                "bootstrapTotalMaxChars": 12000,
+                "contextInjection": "never",
+                "contextTokens": {{ openclaw_chat_context_window }},
+                "experimental": {
+                  "localModelLean": false
+                },
+                "thinkingDefault": "off",
+                "model": {
+                  "primary": "ollama/{{ openclaw_default_model }}",
+                  "fallbacks": {{ openclaw_fallback_models | to_json }}
+                },
+                "compaction": {
+                  "model": "ollama/qwen3.5:2b",
+                  "reserveTokensFloor": 20000,
+                  "keepRecentTokens": 1500,
+                  "midTurnPrecheck": {
+                    "enabled": true
+                  },
+                  "memoryFlush": {
+                    "model": "ollama/qwen3.5:2b"
+                  }
+                },
+                "memorySearch": {
+                  "enabled": true,
+                  "provider": "ollama",
+                  "model": "nomic-embed-text",
+                  "remote": {
+                    "baseUrl": "http://{{ ollama_container_name }}:{{ ollama_port }}",
+                    "apiKey": "ollama-local",
+                    "nonBatchConcurrency": 1
+                  }
+                }
+              }
+            },
+            "models": {
+              "pricing": {
+                "enabled": false
+              },
+              "providers": {
+                "ollama": {
+                  "api": "ollama",
+                  "baseUrl": "http://{{ ollama_container_name }}:{{ ollama_port }}",
+                  "apiKey": "ollama-local",
+                  "timeoutSeconds": {{ ollama_timeout_seconds }},
+                  "models": [
+                    {
+                      "id": "{{ openclaw_default_model }}",
+                      "name": "{{ openclaw_default_model }}",
+                      "contextWindow": {{ openclaw_chat_context_window }},
+                      "maxTokens": {{ openclaw_chat_max_tokens }},
+                      "reasoning": false,
+                      "compat": {
+                        "supportsTools": true
+                      },
+                      "params": {
+                        "num_ctx": {{ openclaw_chat_context_window }},
+                        "num_predict": {{ openclaw_chat_max_tokens }},
+                        "think": false,
+                        "thinking": false,
+                        "keep_alive": {{ ollama_keep_alive | to_json }}
+                      }
+                    },
+                    {
+                      "id": "qwen3.5:2b",
+                      "name": "qwen3.5:2b",
+                      "contextWindow": {{ openclaw_chat_context_window }},
+                      "maxTokens": {{ openclaw_chat_max_tokens }},
+                      "reasoning": false,
+                      "compat": {
+                        "supportsTools": true
+                      },
+                      "params": {
+                        "num_ctx": {{ openclaw_chat_context_window }},
+                        "num_predict": {{ openclaw_chat_max_tokens }},
+                        "think": false,
+                        "thinking": false,
+                        "keep_alive": {{ ollama_keep_alive | to_json }}
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "tools": {
+              "profile": "full",
+              "exec": {
+                "host": "node",
+                "node": "{{ openclaw_node_host_display_name }}",
+                "mode": "full"
+              },
+              "web": {
+                "search": {
+                  "provider": "ollama"
+                }
+              }
+            },
+            "skills": {
+              "load": {
+                "watch": true,
+                "watchDebounceMs": 250
+              },
+              "install": {
+                "preferBrew": {{ openclaw_skills_prefer_brew | bool | to_json }},
+                "nodeManager": {{ openclaw_skills_node_manager | to_json }},
+                "allowUploadedArchives": true
+              }
+            },
+            "plugins": {
+              "enabled": true{% if not openclaw_enable_all_bundled_plugins %},
+              "bundledDiscovery": "allowlist",
+              "allow": {{ openclaw_plugin_allowlist | to_json }}{% endif %}{% if openclaw_existing_plugin_load_paths | length > 0 %},
+              "load": {
+                "paths": {{ openclaw_existing_plugin_load_paths | to_json }}
+              }{% endif %},
+              "entries": {{
+                (
+                  openclaw_existing_plugin_entries
+                  | combine(
+                    {
+                      "active-memory": {
+                        "enabled": false
+                      }
+                    },
+                    recursive=True
+                  )
+                ) | to_json
+              }}{% if openclaw_existing_plugin_installs | length > 0 %},
+              "installs": {{ openclaw_existing_plugin_installs | to_json }}{% endif %}
+            },
+            "channels": {
+              "nextcloud-talk": {
+                "enabled": true,
+                "baseUrl": "{{ nextcloud_tailscale_url_expected | regex_replace('/$', '') }}",
+                "botSecretFile": "/run/secrets/nextcloud-talk-bot-secret",
+                {% if nextcloud_talk_enable_room_lookups %}
+                "apiUser": "{{ nextcloud_talk_api_user }}",
+                "apiPasswordFile": "/run/secrets/nextcloud-talk-api-password",
+                {% endif %}
+                "webhookHost": "{{ openclaw_nextcloud_talk_webhook_host }}",
+                "webhookPort": {{ openclaw_nextcloud_talk_webhook_port }},
+                "webhookPath": "{{ openclaw_nextcloud_talk_webhook_path }}",
+                "webhookPublicUrl": "{{ openclaw_tailscale_webhook_url_expected }}",
+                "dmPolicy": {{ nextcloud_talk_dm_policy | to_json }},
+                "allowFrom": {{ nextcloud_talk_allow_from | to_json }},
+                "groupPolicy": {{ nextcloud_talk_group_policy | to_json }}{% if resolved_nextcloud_talk_room_token | length > 0 %},
+                "rooms": {
+                  "{{ resolved_nextcloud_talk_room_token }}": {
+                    "requireMention": {{ nextcloud_talk_room_require_mention | bool | to_json }}
+                  }
+                }{% endif %},
+                "network": {
+                  "dangerouslyAllowPrivateNetwork": {{ nextcloud_talk_allow_private_network | bool | to_json }}
+                }
+              }
+            }{% if openclaw_existing_meta | length > 0 %},
+            "meta": {{ openclaw_existing_meta | to_json }}{% endif %}
+          }
+      register: openclaw_config_file
+
+    - name: Check for the OpenClaw session index before rotating Talk sessions
+      ansible.builtin.stat:
+        path: "{{ openclaw_state_dir }}/agents/main/sessions/sessions.json"
+      register: openclaw_sessions_index_stat
+      when:
+        - openclaw_config_file.changed
+        - resolved_nextcloud_talk_room_token | length > 0
+
+    - name: Read the OpenClaw session index before rotating Talk sessions
+      ansible.builtin.slurp:
+        path: "{{ openclaw_state_dir }}/agents/main/sessions/sessions.json"
+      register: openclaw_sessions_index_slurp
+      no_log: true
+      when:
+        - openclaw_config_file.changed
+        - resolved_nextcloud_talk_room_token | length > 0
+        - openclaw_sessions_index_stat.stat.exists | default(false)
+
+    - name: Cache the current OpenClaw Talk session mapping
+      ansible.builtin.set_fact:
+        openclaw_nextcloud_talk_session_key: "agent:main:nextcloud-talk:group:{{ resolved_nextcloud_talk_room_token }}"
+        openclaw_sessions_index_data: "{{ openclaw_sessions_index_slurp.content | b64decode | from_json }}"
+      no_log: true
+      when:
+        - openclaw_config_file.changed
+        - resolved_nextcloud_talk_room_token | length > 0
+        - openclaw_sessions_index_slurp is defined
+        - openclaw_sessions_index_slurp.content is defined
+
+    - name: Cache the current OpenClaw Talk session id
+      ansible.builtin.set_fact:
+        openclaw_nextcloud_talk_session_id: >-
+          {{
+            (
+              openclaw_sessions_index_data[openclaw_nextcloud_talk_session_key]
+              | default({})
+            ).sessionId
+            | default('')
+          }}
+      no_log: true
+      when:
+        - openclaw_config_file.changed
+        - openclaw_sessions_index_data is defined
+        - openclaw_nextcloud_talk_session_key is defined
+
+    - name: Remove the stale OpenClaw Talk session mapping after config changes
+      ansible.builtin.copy:
+        dest: "{{ openclaw_state_dir }}/agents/main/sessions/sessions.json"
+        owner: "1000"
+        group: "1000"
+        mode: "0600"
+        content: >-
+          {{
+            (
+              openclaw_sessions_index_data
+              | dict2items
+              | rejectattr('key', 'equalto', openclaw_nextcloud_talk_session_key)
+              | items2dict
+              | to_nice_json
+            ) ~ '\n'
+          }}
+      register: openclaw_nextcloud_talk_session_mapping_reset
+      no_log: true
+      when:
+        - openclaw_config_file.changed
+        - openclaw_nextcloud_talk_session_id | default('') | length > 0
+
+    - name: Find stale OpenClaw Talk session transcript files after config changes
+      ansible.builtin.find:
+        paths: "{{ openclaw_state_dir }}/agents/main/sessions"
+        patterns:
+          - "{{ openclaw_nextcloud_talk_session_id }}*"
+        file_type: file
+      register: openclaw_nextcloud_talk_session_files
+      when:
+        - openclaw_config_file.changed
+        - openclaw_nextcloud_talk_session_id | default('') | length > 0
+
+    - name: Archive stale OpenClaw Talk session transcript files after config changes
+      ansible.builtin.command:
+        argv:
+          - mv
+          - "{{ item.path }}"
+          - "{{ item.path }}.archived-{{ ansible_date_time.iso8601_basic_short }}"
+      loop: "{{ openclaw_nextcloud_talk_session_files.files | default([]) }}"
+      changed_when: true
+      when:
+        - openclaw_config_file.changed
+        - openclaw_nextcloud_talk_session_mapping_reset.changed | default(false)
+
+    - name: Seed the OpenClaw workspace files
+      ansible.builtin.copy:
+        dest: "{{ item.dest }}"
+        owner: "1000"
+        group: "1000"
+        mode: "0640"
+        force: false
+        content: "{{ item.content }}"
+      loop:
+        - dest: "{{ openclaw_workspace_dir }}/AGENTS.md"
+          content: |
+            Keep this laptop's AI services healthy and private on the tailnet.
+            Prefer local tools, Docker services, and conservative changes.
+            Respond naturally to ordinary conversation too; brief greetings like "good morning" should receive a friendly greeting, not a refusal.
+        - dest: "{{ openclaw_workspace_dir }}/SOUL.md"
+          content: |
+            You are OpenClaw on a Fedora laptop. Be concise, practical, and careful with local resources.
+            Be warm and conversational when the user is chatting rather than asking for system changes.
+        - dest: "{{ openclaw_workspace_dir }}/TOOLS.md"
+          content: |
+            Local services:
+            - Ollama: http://{{ ollama_container_name }}:{{ ollama_port }}
+            - Nextcloud: {{ nextcloud_tailscale_url_expected }}
+            - Host Tailnet DNS: {{ tailscale_dns_name | default('unknown') }}
+            - OpenClaw Tailnet DNS: {{ openclaw_tailscale_dns_name_expected }}
+            - Host tool node: {{ openclaw_node_host_display_name }} on {{ tailscale_dns_name | default('merlinsbeard.tail0ee7d.ts.net') }}
+            - Command execution is routed to the host tool node. Do not request the sandbox host for laptop commands.
+            - Browser automation is routed through the host tool node when available.
+            - Tailscale SSH handles host SSH auth; do not create SSH keys for this laptop.
+            - Obsidian vault: {{ openclaw_obsidian_vault_host_path }} on the host node.
+            - To list Obsidian notes, use host command execution or node file tools against `{{ openclaw_obsidian_vault_host_path }}`; do not search the web and do not ask Craig to run `/app/openclaw /approve`.
+        - dest: "{{ openclaw_workspace_dir }}/USER.md"
+          content: |
+            Primary operator: {{ local_login_user }}
+        - dest: "{{ openclaw_workspace_dir }}/MEMORY.md"
+          content: |
+            # MEMORY.md
+
+            Durable facts, stable preferences, and standing decisions for this laptop's OpenClaw agent belong here.
+
+            Keep this file concise.
+            Put detailed or day-specific notes in `memory/YYYY-MM-DD.md` instead.
+        - dest: "{{ openclaw_workspace_dir }}/HOST_TOOLS.md"
+          content: |
+            # Host Tool Node
+
+            OpenClaw is paired with the laptop host node `{{ openclaw_node_host_display_name }}` on `{{ tailscale_dns_name | default('merlinsbeard.tail0ee7d.ts.net') }}`.
+
+            Use normal command execution for laptop work. It is configured to run on the host node, not inside the container.
+
+            Important rules:
+            - Do not request `sandbox` for host laptop commands.
+            - Browser automation is routed through `{{ openclaw_node_host_display_name }}` when available.
+            - Tailscale SSH handles host SSH authentication. Do not create SSH keys for this laptop.
+            - If a tool asks for a node name, use `{{ openclaw_node_host_display_name }}`.
+
+            Known host tools:
+            - Firefox is available on the host.
+            - Obsidian is installed as the Flatpak app `md.obsidian.Obsidian`; the official `obsidian` CLI may not be on PATH unless installed separately.
+            - Craig's Obsidian vault is at `{{ openclaw_obsidian_vault_host_path }}` on the host.
+            - To list notes, run `find {{ openclaw_obsidian_vault_host_path | quote }} -type f -name '*.md' -printf '%P\n' | sort` through the normal exec tool, or use node file tools on that path.
+            - Do not use web search for local Obsidian content.
+            - Do not tell Craig to run `/app/openclaw /approve`; if exec reports approval required, report the tool error plainly.
+
+    - name: Write managed OpenClaw channel guidance
+      ansible.builtin.copy:
+        dest: "{{ openclaw_workspace_dir }}/CHANNELS.md"
+        owner: "1000"
+        group: "1000"
+        mode: "0640"
+        content: |
+          # CHANNELS.md
+
+          ## Nextcloud Talk
+
+          - Nextcloud Talk may include a transport envelope before the actual user text.
+          - A block labeled `Conversation info` is metadata, not the user message.
+          - A raw JSON object like `{"message":"Hi","parameters":[]}` is also transport data.
+          - Treat the `message` field as the real human message text unless the human explicitly asks you to inspect the JSON.
+          - Reply naturally to the human message only.
+          - If the human is just greeting you, greet them back normally.
+          - Do not echo or summarize the envelope JSON unless the human asks about it.
+          - If the message text is just `Hi`, reply to `Hi`, not to the metadata blob.
+
+    - name: Ensure OpenClaw workspace guidance supports normal conversation
+      ansible.builtin.lineinfile:
+        path: "{{ item.path }}"
+        line: "{{ item.line }}"
+        state: present
+        create: true
+        owner: "1000"
+        group: "1000"
+        mode: "0640"
+      loop:
+        - path: "{{ openclaw_workspace_dir }}/AGENTS.md"
+          line: 'Respond naturally to ordinary conversation too; brief greetings like "good morning" should receive a friendly greeting, not a refusal.'
+        - path: "{{ openclaw_workspace_dir }}/SOUL.md"
+          line: "Be warm and conversational when the user is chatting rather than asking for system changes."
+        - path: "{{ openclaw_workspace_dir }}/TOOLS.md"
+          line: "Obsidian vault: {{ openclaw_obsidian_vault_host_path }} on the host node."
+        - path: "{{ openclaw_workspace_dir }}/TOOLS.md"
+          line: "To list Obsidian notes, use host command execution or node file tools against `{{ openclaw_obsidian_vault_host_path }}`; do not search the web and do not ask Craig to run `/app/openclaw /approve`."
+        - path: "{{ openclaw_workspace_dir }}/HOST_TOOLS.md"
+          line: "Craig's Obsidian vault is at `{{ openclaw_obsidian_vault_host_path }}` on the host."
+        - path: "{{ openclaw_workspace_dir }}/HOST_TOOLS.md"
+          line: "Do not tell Craig to run `/app/openclaw /approve`; if exec reports approval required, report the tool error plainly."
+
+    - name: Uninstall legacy Podman packages
+      ansible.builtin.dnf:
+        name: "{{ podman_cleanup_packages }}"
+        state: absent
+        autoremove: true
+      failed_when: false
+
+    - name: Run the Ollama container with NVIDIA GPU access
+      community.docker.docker_container:
+        name: "{{ ollama_container_name }}"
+        image: "{{ ollama_image }}"
+        state: started
+        pull: true
+        restart_policy: unless-stopped
+        device_requests:
+          - driver: nvidia
+            count: -1
+            capabilities:
+              - ["gpu"]
+        env: >-
+          {{
+            {'OLLAMA_HOST': '0.0.0.0:' ~ (ollama_port | string)}
+            | combine({
+                'NVIDIA_VISIBLE_DEVICES': 'all',
+                'NVIDIA_DRIVER_CAPABILITIES': 'compute,utility'
+              })
+          }}
+        volumes:
+          - "{{ ollama_state_dir }}:/root/.ollama:Z"
+        networks:
+          - name: "{{ ai_services_docker_network_name }}"
+            aliases:
+              - "{{ ollama_container_name }}"
+        published_ports:
+          - "{{ ollama_publish_host }}:{{ ollama_port }}:{{ ollama_port }}"
+      when: has_nvidia_gpu
+
+    - name: Run the Ollama container without a GPU
+      community.docker.docker_container:
+        name: "{{ ollama_container_name }}"
+        image: "{{ ollama_image }}"
+        state: started
+        pull: true
+        restart_policy: unless-stopped
+        env:
+          OLLAMA_HOST: "0.0.0.0:{{ ollama_port }}"
+        volumes:
+          - "{{ ollama_state_dir }}:/root/.ollama:Z"
+        networks:
+          - name: "{{ ai_services_docker_network_name }}"
+            aliases:
+              - "{{ ollama_container_name }}"
+        published_ports:
+          - "{{ ollama_publish_host }}:{{ ollama_port }}:{{ ollama_port }}"
+      when: not has_nvidia_gpu
+
+    - name: Wait for the Ollama API to answer
+      ansible.builtin.uri:
+        url: "http://{{ ollama_publish_host }}:{{ ollama_port }}/api/tags"
+        method: GET
+        status_code: 200
+      register: ollama_api_check
+      retries: 20
+      delay: 5
+      until: ollama_api_check.status == 200
+
+    - name: Query the currently available Ollama models
+      ansible.builtin.uri:
+        url: "http://{{ ollama_publish_host }}:{{ ollama_port }}/api/tags"
+        method: GET
+        status_code: 200
+      register: ollama_tags
+      changed_when: false
+
+    - name: Cache normalized Ollama model names before pull attempts
+      ansible.builtin.set_fact:
+        ollama_available_models_before_pull: >-
+          {{
+            (
+              (ollama_tags.json.models | default([]))
+              | map(attribute='name')
+              | list
+            )
+            +
+            (
+              (ollama_tags.json.models | default([]))
+              | map(attribute='name')
+              | map('regex_replace', ':latest$', '')
+              | list
+            )
+          | unique
+          }}
+
+    - name: Pull requested Ollama models via the HTTP API
+      ansible.builtin.uri:
+        url: "http://{{ ollama_publish_host }}:{{ ollama_port }}/api/pull"
+        method: POST
+        body_format: json
+        body:
+          name: "{{ item }}"
+          stream: false
+        status_code: [200, 500]
+        return_content: true
+        timeout: "{{ ollama_model_pull_timeout }}"
+      register: ollama_model_pull_result
+      loop: "{{ ollama_models }}"
+      when: item not in ollama_available_models_before_pull
+      changed_when: true
+      failed_when: false
+      retries: "{{ ollama_model_pull_retries }}"
+      delay: "{{ ollama_model_pull_delay }}"
+      until: >-
+        (ollama_model_pull_result.status | default(0)) == 200
+        and (
+          (
+            ollama_model_pull_result.json.error
+            if (ollama_model_pull_result.json is defined and 'error' in ollama_model_pull_result.json)
+            else ''
+          ) | length
+        ) == 0
+
+    - name: Re-query the currently available Ollama models after pull attempts
+      ansible.builtin.uri:
+        url: "http://{{ ollama_publish_host }}:{{ ollama_port }}/api/tags"
+        method: GET
+        status_code: 200
+      register: ollama_tags_after_pull
+      changed_when: false
+
+    - name: Cache normalized Ollama model names after pull attempts
+      ansible.builtin.set_fact:
+        ollama_available_models_after_pull: >-
+          {{
+            (
+              (ollama_tags_after_pull.json.models | default([]))
+              | map(attribute='name')
+              | list
+            )
+            +
+            (
+              (ollama_tags_after_pull.json.models | default([]))
+              | map(attribute='name')
+              | map('regex_replace', ':latest$', '')
+              | list
+            )
+          | unique
+          }}
+
+    - name: Cache any Ollama models still missing after pull attempts
+      ansible.builtin.set_fact:
+        ollama_missing_models: >-
+          {{
+            ollama_models
+            | difference(ollama_available_models_after_pull)
+          }}
+
+    - name: Fail when required Ollama models could not be pulled
+      ansible.builtin.assert:
+        that:
+          - ollama_missing_models | length == 0
+        fail_msg: >-
+          Ollama could not pull these models: {{ ollama_missing_models | join(', ') }}.
+          This is usually a connectivity issue to registry.ollama.ai. Set
+          `ollama_fail_on_model_pull_error: false` to continue provisioning and
+          pull the models later.
+      when: ollama_fail_on_model_pull_error
+
+    - name: Warn when Ollama models could not be pulled during provisioning
+      ansible.builtin.debug:
+        msg: >-
+          Ollama could not pull these models during provisioning:
+          {{ ollama_missing_models | join(', ') }}.
+          The laptop build is continuing, but OpenClaw may not be fully usable
+          until those models are available locally.
+      when:
+        - not ollama_fail_on_model_pull_error
+        - ollama_missing_models | length > 0
+
+    - name: Build the custom OpenClaw image with Homebrew for skill binaries
+      community.docker.docker_image:
+        name: "{{ openclaw_image }}"
+        source: build
+        force_source: true
+        build:
+          path: "{{ playbook_dir }}/docker/openclaw"
+          pull: true
+          args:
+            OPENCLAW_BASE_IMAGE: "{{ openclaw_base_image }}"
+
+    - name: Run the OpenClaw container
+      community.docker.docker_container:
+        name: "{{ openclaw_container_name }}"
+        image: "{{ openclaw_image }}"
+        state: started
+        pull: "{{ openclaw_container_pull_policy }}"
+        restart_policy: unless-stopped
+        env:
+          OPENCLAW_CONFIG_PATH: /config/openclaw.json
+          OPENCLAW_GATEWAY_TOKEN: "{{ openclaw_gateway_token }}"
+        volumes:
+          - "{{ openclaw_config_dir }}:/config:Z"
+          - "{{ openclaw_state_dir }}:/home/node/.openclaw:Z"
+          - "{{ openclaw_workspace_dir }}:/workspace:Z"
+          - "{{ openclaw_secrets_dir }}/nextcloud-talk-bot-secret:/run/secrets/nextcloud-talk-bot-secret:Z"
+          - "{{ openclaw_secrets_dir }}/nextcloud-talk-api-password:/run/secrets/nextcloud-talk-api-password:Z"
+        networks:
+          - name: "{{ ai_services_docker_network_name }}"
+        published_ports:
+          - "127.0.0.1:{{ openclaw_gateway_port }}:{{ openclaw_gateway_port }}"
+          - "127.0.0.1:{{ openclaw_nextcloud_talk_webhook_port }}:{{ openclaw_nextcloud_talk_webhook_port }}"
+        memory: "{{ openclaw_memory_limit }}"
+        memory_reservation: "{{ openclaw_memory_reservation }}"
+      no_log: true
+
+    - name: Check whether the official Nextcloud Talk plugin is already installed
+      ansible.builtin.stat:
+        path: "{{ openclaw_config_dir }}/npm/node_modules/@openclaw/nextcloud-talk/package.json"
+      register: openclaw_nextcloud_talk_plugin_stat
+
+    - name: Install the official Nextcloud Talk plugin when it is missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - node
+          - --env
+          - HOME=/home/node
+          - --env
+          - OPENCLAW_CONFIG_PATH=/config/openclaw.json
+          - "{{ openclaw_container_name }}"
+          - openclaw
+          - plugins
+          - install
+          - "@openclaw/nextcloud-talk"
+      register: openclaw_nextcloud_talk_plugin_install
+      changed_when: openclaw_nextcloud_talk_plugin_install.rc == 0
+      failed_when: false
+      when: not openclaw_nextcloud_talk_plugin_stat.stat.exists
+
+    - name: Restart OpenClaw after configuration or secret changes
+      community.docker.docker_container:
+        name: "{{ openclaw_container_name }}"
+        state: started
+        restart: true
+      when:
+        - openclaw_config_file.changed
+          or openclaw_talk_bot_secret_file.changed
+          or openclaw_talk_api_password_file.changed
+
+    - name: Restart OpenClaw after installing the official Nextcloud Talk plugin
+      community.docker.docker_container:
+        name: "{{ openclaw_container_name }}"
+        state: started
+        restart: true
+      when: openclaw_nextcloud_talk_plugin_install is changed
+
+    - name: Ensure the OpenClaw host-node systemd directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ local_login_user }}"
+        group: "{{ local_login_user }}"
+        mode: "0750"
+      loop:
+        - "{{ openclaw_node_host_systemd_dir }}"
+        - "{{ openclaw_node_host_systemd_dir }}/openclaw-node.service.d"
+        - "{{ openclaw_node_host_home }}"
+        - "{{ openclaw_node_host_home }}/.openclaw"
+      when: openclaw_node_host_enabled
+
+    - name: Write the OpenClaw host-node gateway token environment
+      ansible.builtin.copy:
+        dest: "{{ openclaw_node_host_home }}/.openclaw/node.systemd.env"
+        owner: "{{ local_login_user }}"
+        group: "{{ local_login_user }}"
+        mode: "0600"
+        content: |
+          OPENCLAW_GATEWAY_TOKEN={{ openclaw_gateway_token }}
+      no_log: true
+      when: openclaw_node_host_enabled
+
+    - name: Install the OpenClaw host-node user service
+      ansible.builtin.copy:
+        dest: "{{ openclaw_node_host_systemd_dir }}/openclaw-node.service"
+        owner: "{{ local_login_user }}"
+        group: "{{ local_login_user }}"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=OpenClaw Host Tool Node ({{ openclaw_node_host_display_name }})
+          After=network-online.target
+          Wants=network-online.target
+          StartLimitBurst=5
+          StartLimitIntervalSec=60
+
+          [Service]
+          ExecStart=/usr/bin/npx -y {{ openclaw_node_host_package }} node run --host 127.0.0.1 --port {{ openclaw_gateway_port }} --display-name {{ openclaw_node_host_display_name }}
+          Restart=always
+          RestartSec=5
+          TimeoutStopSec=30
+          TimeoutStartSec=60
+          SuccessExitStatus=0 143
+          KillMode=control-group
+          EnvironmentFile=-{{ openclaw_node_host_home }}/.openclaw/node.systemd.env
+          Environment=HOME=/home/{{ local_login_user }}
+          Environment=OPENCLAW_HOME={{ openclaw_node_host_home }}
+          Environment=OPENCLAW_STATE_DIR={{ openclaw_node_host_home }}/.openclaw
+          Environment=PATH=/usr/bin:/bin:/home/{{ local_login_user }}/.local/bin:/home/{{ local_login_user }}/bin:/usr/local/bin
+          UnsetEnvironment=OPENCLAW_CONFIG_PATH
+
+          [Install]
+          WantedBy=default.target
+      register: openclaw_node_host_service_file
+      when: openclaw_node_host_enabled
+
+    - name: Reload the OpenClaw host-node user systemd manager
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - --user
+          - daemon-reload
+      become: true
+      become_user: "{{ local_login_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ local_login_uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ local_login_uid }}/bus"
+      changed_when: openclaw_node_host_service_file.changed
+      when: openclaw_node_host_enabled
+
+    - name: Enable and start the OpenClaw host-node user service
+      ansible.builtin.systemd_service:
+        name: openclaw-node.service
+        scope: user
+        enabled: true
+        state: restarted
+      become: true
+      become_user: "{{ local_login_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ local_login_uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ local_login_uid }}/bus"
+      when: openclaw_node_host_enabled
+
+    - name: Wait briefly for the OpenClaw host node to request or refresh pairing
+      ansible.builtin.pause:
+        seconds: 4
+      when: openclaw_node_host_enabled
+
+    - name: Discover pending OpenClaw host-node pairing requests
+      ansible.builtin.shell: |
+        set -o pipefail
+        pending_json="$(
+          docker exec {{ openclaw_container_name }} sh -lc \
+            'OPENCLAW_CONFIG_PATH=/config/openclaw.json openclaw nodes pending --json' \
+            | awk 'BEGIN { emit=0 } /^[[:space:]]*[\[{]/ { emit=1 } emit { print }'
+        )"
+        printf '%s\n' "${pending_json}" \
+          | jq -r --arg name {{ openclaw_node_host_display_name | quote }} \
+              '.[] | select(.displayName == $name) | .requestId' \
+          | head -n 1
+      args:
+        executable: /bin/bash
+      register: openclaw_node_host_pending_request
+      changed_when: false
+      when: openclaw_node_host_enabled
+
+    - name: Approve the OpenClaw host-node pairing request
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ openclaw_container_name }}"
+          - sh
+          - -lc
+          - "OPENCLAW_CONFIG_PATH=/config/openclaw.json openclaw nodes approve {{ openclaw_node_host_pending_request.stdout | trim }} --json"
+      no_log: true
+      when:
+        - openclaw_node_host_enabled
+        - openclaw_node_host_pending_request.stdout | trim | length > 0
+
+    - name: Assert the OpenClaw host node is connected with system tools
+      ansible.builtin.shell: |
+        set -o pipefail
+        status_json="$(
+          docker exec {{ openclaw_container_name }} sh -lc \
+            'OPENCLAW_CONFIG_PATH=/config/openclaw.json openclaw nodes status --json' \
+            | awk 'BEGIN { emit=0 } /^[[:space:]]*[\[{]/ { emit=1 } emit { print }'
+        )"
+        printf '%s\n' "${status_json}" \
+          | jq -e --arg name {{ openclaw_node_host_display_name | quote }} '
+              .nodes[]
+              | select(.displayName == $name)
+              | select(.connected == true)
+              | select((.commands // []) | index("system.run"))
+              | select((.commands // []) | index("browser.proxy"))
+            '
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: openclaw_node_host_enabled
+
+    - name: Synchronize the OpenClaw host-node exec approval policy
+      ansible.builtin.shell: |
+        set -o pipefail
+        desired_json={{ openclaw_node_host_exec_approvals | to_json | quote }}
+        current_json="$(
+          docker exec {{ openclaw_container_name }} sh -lc \
+            'OPENCLAW_CONFIG_PATH=/config/openclaw.json openclaw approvals get --node {{ openclaw_node_host_display_name | quote }} --json' \
+            | awk 'BEGIN { emit=0 } /^[[:space:]]*[\[{]/ { emit=1 } emit { print }'
+        )"
+
+        if printf '%s\n' "${current_json}" \
+          | jq -e --argjson desired "${desired_json}" '
+              (.file.version // 1) == ($desired.version // 1)
+              and (.file.defaults // {}) == ($desired.defaults // {})
+              and (.file.agents // {}) == ($desired.agents // {})
+            ' >/dev/null; then
+          printf '%s\n' unchanged
+          exit 0
+        fi
+
+        printf '%s\n' "${desired_json}" \
+          | docker exec -i {{ openclaw_container_name }} sh -lc \
+              'OPENCLAW_CONFIG_PATH=/config/openclaw.json openclaw approvals set --node {{ openclaw_node_host_display_name | quote }} --stdin --json'
+        printf '%s\n' changed
+      args:
+        executable: /bin/bash
+      register: openclaw_node_host_exec_approvals_sync
+      changed_when: "'changed' in openclaw_node_host_exec_approvals_sync.stdout_lines"
+      when: openclaw_node_host_enabled
+
+    - name: Wait for the local OpenClaw Talk webhook listener to answer
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --output
+          - /dev/null
+          - --write-out
+          - "%{http_code}"
+          - --request
+          - POST
+          - --header
+          - "Content-Type: application/json"
+          - --data
+          - "{}"
+          - "http://127.0.0.1:{{ openclaw_nextcloud_talk_webhook_port }}{{ openclaw_nextcloud_talk_webhook_path }}"
+      register: openclaw_talk_webhook_status_initial
+      changed_when: false
+      failed_when: false
+      retries: 20
+      delay: 3
+      until: >-
+        openclaw_talk_webhook_status_initial.rc == 0
+        and (
+          openclaw_talk_webhook_status_initial.stdout | trim
+        ) in ['200', '400', '401', '403', '405', '422']
+
+    - name: Install or refresh the official Nextcloud Talk plugin when the webhook listener is unavailable
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - node
+          - --env
+          - HOME=/home/node
+          - --env
+          - OPENCLAW_CONFIG_PATH=/config/openclaw.json
+          - "{{ openclaw_container_name }}"
+          - openclaw
+          - plugins
+          - install
+          - "@openclaw/nextcloud-talk"
+          - --force
+      register: openclaw_nextcloud_talk_plugin_install_fallback
+      changed_when: openclaw_nextcloud_talk_plugin_install_fallback.rc == 0
+      failed_when: false
+      when: >-
+        openclaw_talk_webhook_status_initial.rc != 0
+        or (
+          openclaw_talk_webhook_status_initial.stdout | trim
+        ) not in ['200', '400', '401', '403', '405', '422']
+
+    - name: Restart OpenClaw after installing the official Nextcloud Talk plugin
+      community.docker.docker_container:
+        name: "{{ openclaw_container_name }}"
+        state: started
+        restart: true
+      when: openclaw_nextcloud_talk_plugin_install_fallback is changed
+
+    - name: Re-check the local OpenClaw Talk webhook listener after plugin installation
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --output
+          - /dev/null
+          - --write-out
+          - "%{http_code}"
+          - --request
+          - POST
+          - --header
+          - "Content-Type: application/json"
+          - --data
+          - "{}"
+          - "http://127.0.0.1:{{ openclaw_nextcloud_talk_webhook_port }}{{ openclaw_nextcloud_talk_webhook_path }}"
+      register: openclaw_talk_webhook_status_after_plugin_install
+      changed_when: false
+      failed_when: false
+      when: >-
+        openclaw_nextcloud_talk_plugin_install_fallback is defined
+        and (openclaw_nextcloud_talk_plugin_install_fallback.rc is defined)
+        and openclaw_nextcloud_talk_plugin_install_fallback.rc == 0
+      retries: 20
+      delay: 3
+      until: >-
+        openclaw_talk_webhook_status_after_plugin_install.rc == 0
+        and (
+          openclaw_talk_webhook_status_after_plugin_install.stdout | trim
+        ) in ['200', '400', '401', '403', '405', '422']
+
+    - name: Choose the final OpenClaw Talk webhook probe result
+      ansible.builtin.set_fact:
+        openclaw_talk_webhook_status: >-
+          {{
+            openclaw_talk_webhook_status_after_plugin_install
+            if (
+              openclaw_talk_webhook_status_after_plugin_install is defined
+              and openclaw_nextcloud_talk_plugin_install_fallback is defined
+              and (openclaw_nextcloud_talk_plugin_install_fallback.rc is defined)
+              and openclaw_nextcloud_talk_plugin_install_fallback.rc == 0
+            )
+            else openclaw_talk_webhook_status_initial
+          }}
+
+    - name: Capture recent OpenClaw logs when the Talk webhook listener is unavailable
+      ansible.builtin.command:
+        argv:
+          - docker
+          - logs
+          - --tail
+          - "120"
+          - "{{ openclaw_container_name }}"
+      register: openclaw_talk_webhook_logs
+      changed_when: false
+      failed_when: false
+      when: >-
+        openclaw_talk_webhook_status.rc != 0
+        or (
+          openclaw_talk_webhook_status.stdout | trim
+        ) not in ['200', '400', '401', '403', '405', '422']
+
+    - name: Assert the local OpenClaw Talk webhook listener is reachable
+      ansible.builtin.assert:
+        that:
+          - openclaw_talk_webhook_status.rc == 0
+          - (openclaw_talk_webhook_status.stdout | trim) in ['200', '400', '401', '403', '405', '422']
+        fail_msg: >-
+          OpenClaw did not expose the Nextcloud Talk webhook listener at
+          http://127.0.0.1:{{ openclaw_nextcloud_talk_webhook_port }}{{ openclaw_nextcloud_talk_webhook_path }}.
+          curl_rc={{ openclaw_talk_webhook_status.rc | default('unknown') }}
+          http_status={{ openclaw_talk_webhook_status.stdout | default('') | trim }}
+          stderr={{ openclaw_talk_webhook_status.stderr | default('') | trim }}.
+          initial_plugin_install_rc={{ openclaw_nextcloud_talk_plugin_install.rc | default('not-run') }}
+          initial_plugin_install_stdout={{ openclaw_nextcloud_talk_plugin_install.stdout | default('') | trim }}
+          initial_plugin_install_stderr={{ openclaw_nextcloud_talk_plugin_install.stderr | default('') | trim }}.
+          fallback_plugin_install_rc={{ openclaw_nextcloud_talk_plugin_install_fallback.rc | default('not-run') }}
+          fallback_plugin_install_stdout={{ openclaw_nextcloud_talk_plugin_install_fallback.stdout | default('') | trim }}
+          fallback_plugin_install_stderr={{ openclaw_nextcloud_talk_plugin_install_fallback.stderr | default('') | trim }}.
+          Recent OpenClaw logs:
+          {{ openclaw_talk_webhook_logs.stdout | default('') | trim }}
+
+    - name: Run the Nextcloud AIO mastercontainer
+      community.docker.docker_container:
+        name: "{{ nextcloud_aio_mastercontainer_name }}"
+        image: "{{ nextcloud_aio_mastercontainer_image }}"
+        state: started
+        pull: true
+        init: true
+        restart_policy: unless-stopped
+        security_opts:
+          - label:disable
+        env:
+          APACHE_PORT: "{{ nextcloud_aio_apache_port | string }}"
+          APACHE_IP_BINDING: "{{ nextcloud_aio_apache_ip_binding }}"
+          AIO_DISABLE_BACKUP_SECTION: "true"
+          DOCKER_API_VERSION: "{{ nextcloud_aio_docker_api_version }}"
+          NEXTCLOUD_STARTUP_APPS: "{{ nextcloud_talk_app_id }}"
+          SKIP_DOMAIN_VALIDATION: "true"
+        volumes:
+          - "nextcloud_aio_mastercontainer:/mnt/docker-aio-config"
+          - "/var/run/docker.sock:/var/run/docker.sock:ro"
+        published_ports:
+          - "127.0.0.1:{{ nextcloud_aio_interface_port }}:8080"
+
+    - name: Discover the Nextcloud AIO mastercontainer volume mountpoint
+      ansible.builtin.command:
+        argv:
+          - docker
+          - volume
+          - inspect
+          - --format
+          - "{{ '{{ .Mountpoint }}' }}"
+          - nextcloud_aio_mastercontainer
+      register: nextcloud_aio_mastercontainer_volume_mountpoint_raw
+      changed_when: false
+
+    - name: Cache the Nextcloud AIO configuration path
+      ansible.builtin.set_fact:
+        nextcloud_aio_configuration_path: >-
+          {{
+            (nextcloud_aio_mastercontainer_volume_mountpoint_raw.stdout | trim)
+            ~ '/data/configuration.json'
+          }}
+
+    - name: Wait for the Nextcloud AIO configuration file to appear
+      ansible.builtin.stat:
+        path: "{{ nextcloud_aio_configuration_path }}"
+      register: nextcloud_aio_configuration_stat
+      changed_when: false
+      retries: 20
+      delay: 3
+      until: >-
+        nextcloud_aio_configuration_stat.stat.exists
+        and (nextcloud_aio_configuration_stat.stat.size | default(0) | int) > 0
+
+    - name: Read the current Nextcloud AIO configuration
+      ansible.builtin.slurp:
+        src: "{{ nextcloud_aio_configuration_path }}"
+      register: nextcloud_aio_configuration_raw
+      no_log: true
+
+    - name: Parse the current Nextcloud AIO configuration
+      ansible.builtin.set_fact:
+        nextcloud_aio_configuration_json: >-
+          {{
+            (nextcloud_aio_configuration_raw.content | b64decode | from_json)
+          }}
+      no_log: true
+
+    - name: Persist the Bitwarden-sourced Nextcloud AIO passphrase
+      ansible.builtin.copy:
+        dest: "{{ nextcloud_aio_configuration_path }}"
+        mode: "0600"
+        content: >-
+          {{
+            (
+              nextcloud_aio_configuration_json
+              | combine({'password': nextcloud_aio_passphrase})
+            ) | to_nice_json
+          }}
+      register: nextcloud_aio_passphrase_config
+      when: (nextcloud_aio_configuration_json.password | default('')) != nextcloud_aio_passphrase
+      no_log: true
+
+    - name: Restart the Nextcloud AIO mastercontainer after passphrase changes
+      community.docker.docker_container:
+        name: "{{ nextcloud_aio_mastercontainer_name }}"
+        state: started
+        restart: true
+      when: nextcloud_aio_passphrase_config is changed
+
+    - name: Run the OpenClaw Tailscale sidecar
+      community.docker.docker_container:
+        name: "{{ openclaw_tailscale_container_name }}"
+        image: "{{ tailscale_sidecar_image }}"
+        state: started
+        pull: true
+        restart_policy: unless-stopped
+        network_mode: host
+        capabilities:
+          - net_admin
+          - net_raw
+        env:
+          TS_AUTHKEY: "{{ openclaw_tailscale_authkey_effective }}"
+          TS_AUTH_ONCE: "false"
+          TS_HOSTNAME: "{{ openclaw_tailscale_hostname }}"
+          TS_EXTRA_ARGS: "{{ openclaw_tailscale_extra_args }}"
+          TS_STATE_DIR: /var/lib/tailscale
+          TS_USERSPACE: "true"
+          TS_ACCEPT_DNS: "true"
+        volumes:
+          - "{{ openclaw_tailscale_state_dir }}:/var/lib/tailscale:Z"
+      no_log: true
+
+    - name: Run the Nextcloud Tailscale sidecar
+      community.docker.docker_container:
+        name: "{{ nextcloud_tailscale_container_name }}"
+        image: "{{ tailscale_sidecar_image }}"
+        state: started
+        pull: true
+        restart_policy: unless-stopped
+        network_mode: host
+        capabilities:
+          - net_admin
+          - net_raw
+        env:
+          TS_AUTHKEY: "{{ nextcloud_tailscale_authkey_effective }}"
+          TS_AUTH_ONCE: "false"
+          TS_HOSTNAME: "{{ nextcloud_tailscale_hostname }}"
+          TS_EXTRA_ARGS: "{{ nextcloud_tailscale_extra_args }}"
+          TS_STATE_DIR: /var/lib/tailscale
+          TS_USERSPACE: "true"
+          TS_ACCEPT_DNS: "true"
+        volumes:
+          - "{{ nextcloud_tailscale_state_dir }}:/var/lib/tailscale:Z"
+      no_log: true
+
+    - name: Wait for the Nextcloud AIO interface to answer locally
+      ansible.builtin.uri:
+        url: "https://127.0.0.1:{{ nextcloud_aio_interface_port }}/"
+        method: GET
+        validate_certs: false
+        status_code: [200, 302, 401, 404]
+      register: nextcloud_aio_interface_status
+      failed_when: false
+      retries: 20
+      delay: 5
+      until: nextcloud_aio_interface_status.status in [200, 302, 401, 404]
+
+    - name: Capture recent Nextcloud AIO mastercontainer logs when interface is unavailable
+      ansible.builtin.command:
+        argv:
+          - docker
+          - logs
+          - --tail
+          - "120"
+          - "{{ nextcloud_aio_mastercontainer_name }}"
+      register: nextcloud_aio_interface_logs
+      changed_when: false
+      failed_when: false
+      when: nextcloud_aio_interface_status.status | default(-1) not in [200, 302, 401, 404]
+
+    - name: Decide whether the Nextcloud AIO setup interface is effectively ready
+      ansible.builtin.set_fact:
+        nextcloud_aio_interface_ready: >-
+          {{
+            (
+              nextcloud_aio_interface_status.status | default(-1)
+            ) in [200, 302, 401, 404]
+            or
+            (
+              'Initial startup of Nextcloud All-in-One complete!'
+              in (nextcloud_aio_interface_logs.stdout | default(''))
+            )
+          }}
+
+    - name: Assert the Nextcloud AIO setup interface is effectively ready
+      ansible.builtin.assert:
+        that:
+          - nextcloud_aio_interface_ready | bool
+        fail_msg: >-
+          Nextcloud AIO did not expose the local setup interface at
+          https://127.0.0.1:{{ nextcloud_aio_interface_port }}/ and the mastercontainer
+          logs do not indicate successful interface startup.
+          status={{ nextcloud_aio_interface_status.status | default('unknown') }}
+          msg={{ nextcloud_aio_interface_status.msg | default('') | trim }}.
+          Recent mastercontainer logs:
+          {{ nextcloud_aio_interface_logs.stdout | default('') | trim }}
+
+    - name: Wait for the OpenClaw Tailscale sidecar to join the tailnet
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ openclaw_tailscale_container_name }}"
+          - tailscale
+          - status
+          - --json
+      register: openclaw_tailscale_status_raw
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 5
+      until: >-
+        openclaw_tailscale_status_raw.rc == 0
+        and (
+          (openclaw_tailscale_status_raw.stdout | from_json).Self.Online | default(false)
+        )
+
+    - name: Wait for the Nextcloud Tailscale sidecar to join the tailnet
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ nextcloud_tailscale_container_name }}"
+          - tailscale
+          - status
+          - --json
+      register: nextcloud_tailscale_status_raw
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 5
+      until: >-
+        nextcloud_tailscale_status_raw.rc == 0
+        and (
+          (nextcloud_tailscale_status_raw.stdout | from_json).Self.Online | default(false)
+        )
+
+    - name: Parse Tailscale sidecar status payloads safely
+      ansible.builtin.set_fact:
+        openclaw_tailscale_status_json: >-
+          {{
+            (openclaw_tailscale_status_raw.stdout | from_json)
+            if (openclaw_tailscale_status_raw.stdout | default('') | trim | length > 0)
+            else {}
+          }}
+        nextcloud_tailscale_status_json: >-
+          {{
+            (nextcloud_tailscale_status_raw.stdout | from_json)
+            if (nextcloud_tailscale_status_raw.stdout | default('') | trim | length > 0)
+            else {}
+          }}
+
+    - name: Capture recent OpenClaw Tailscale sidecar logs when join fails
+      ansible.builtin.command:
+        argv:
+          - docker
+          - logs
+          - --tail
+          - "60"
+          - "{{ openclaw_tailscale_container_name }}"
+      register: openclaw_tailscale_logs
+      changed_when: false
+      failed_when: false
+      when: not (openclaw_tailscale_status_json.Self.Online | default(false))
+
+    - name: Capture recent Nextcloud Tailscale sidecar logs when join fails
+      ansible.builtin.command:
+        argv:
+          - docker
+          - logs
+          - --tail
+          - "60"
+          - "{{ nextcloud_tailscale_container_name }}"
+      register: nextcloud_tailscale_logs
+      changed_when: false
+      failed_when: false
+      when: not (nextcloud_tailscale_status_json.Self.Online | default(false))
+
+    - name: Assert the OpenClaw Tailscale sidecar joined successfully
+      ansible.builtin.assert:
+        that:
+          - (openclaw_tailscale_status_json.Self.Online | default(false))
+        fail_msg: >-
+          The OpenClaw Tailscale sidecar did not join the tailnet successfully.
+          rc={{ openclaw_tailscale_status_raw.rc | default('unknown') }}
+          backend_state={{ openclaw_tailscale_status_json.BackendState | default('unknown') }}
+          stdout={{ openclaw_tailscale_status_raw.stdout | default('') | trim }}
+          stderr={{ openclaw_tailscale_status_raw.stderr | default('') | trim }}.
+          recent_logs={{ openclaw_tailscale_logs.stdout | default('') | trim }}.
+          This usually means the sidecar cannot reach the Tailscale control plane,
+          or the auth key is missing, expired, single-use, or not preauthorized
+          for service-sidecar login.
+
+    - name: Assert the Nextcloud Tailscale sidecar joined successfully
+      ansible.builtin.assert:
+        that:
+          - (nextcloud_tailscale_status_json.Self.Online | default(false))
+        fail_msg: >-
+          The Nextcloud Tailscale sidecar did not join the tailnet successfully.
+          rc={{ nextcloud_tailscale_status_raw.rc | default('unknown') }}
+          backend_state={{ nextcloud_tailscale_status_json.BackendState | default('unknown') }}
+          stdout={{ nextcloud_tailscale_status_raw.stdout | default('') | trim }}
+          stderr={{ nextcloud_tailscale_status_raw.stderr | default('') | trim }}.
+          recent_logs={{ nextcloud_tailscale_logs.stdout | default('') | trim }}.
+          This usually means the sidecar cannot reach the Tailscale control plane,
+          or the auth key is missing, expired, single-use, or not preauthorized
+          for service-sidecar login.
+
+    - name: Cache the OpenClaw and Nextcloud Tailscale DNS names
+      ansible.builtin.set_fact:
+        openclaw_tailscale_dns_name: >-
+          {{
+            (
+              openclaw_tailscale_status_json.Self.DNSName
+            ) | default(openclaw_tailscale_dns_name_expected) | trim | regex_replace('[.]$', '')
+          }}
+        nextcloud_tailscale_dns_name: >-
+          {{
+            (
+              nextcloud_tailscale_status_json.Self.DNSName
+            ) | default(nextcloud_tailscale_dns_name_expected) | trim | regex_replace('[.]$', '')
+          }}
+
+    - name: Cache the OpenClaw and Nextcloud Tailscale URLs
+      ansible.builtin.set_fact:
+        openclaw_tailscale_url: >-
+          https://{{ openclaw_tailscale_dns_name }}/
+        openclaw_tailscale_webhook_url: >-
+          https://{{ openclaw_tailscale_dns_name }}:{{ openclaw_tailscale_webhook_https_port }}{{ openclaw_nextcloud_talk_webhook_path }}
+        nextcloud_tailscale_url: >-
+          https://{{ nextcloud_tailscale_dns_name }}/
+
+    - name: Configure HTTPS Tailscale Serve for OpenClaw
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ openclaw_tailscale_container_name }}"
+          - tailscale
+          - serve
+          - --bg
+          - --yes
+          - --https={{ openclaw_tailscale_https_port }}
+          - "http://127.0.0.1:{{ openclaw_gateway_port }}"
+      changed_when: false
+
+    - name: Configure HTTPS Tailscale Serve for the OpenClaw Talk webhook
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ openclaw_tailscale_container_name }}"
+          - tailscale
+          - serve
+          - --bg
+          - --yes
+          - --https={{ openclaw_tailscale_webhook_https_port }}
+          - "http://127.0.0.1:{{ openclaw_nextcloud_talk_webhook_port }}"
+      changed_when: false
+
+    - name: Wait for the Nextcloud AIO backend to answer locally
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --silent
+          - --show-error
+          - --location
+          - --output
+          - /dev/null
+          - --connect-timeout
+          - "10"
+          - --max-time
+          - "30"
+          - "http://127.0.0.1:{{ nextcloud_aio_apache_port }}/status.php"
+      register: nextcloud_backend_status
+      changed_when: false
+      failed_when: false
+      retries: 12
+      delay: 10
+      until: nextcloud_backend_status.rc == 0
+      ignore_errors: true
+
+    - name: Capture recent Nextcloud AIO mastercontainer logs when backend is not ready
+      ansible.builtin.command:
+        argv:
+          - docker
+          - logs
+          - --tail
+          - "80"
+          - "{{ nextcloud_aio_mastercontainer_name }}"
+      register: nextcloud_aio_mastercontainer_logs
+      changed_when: false
+      failed_when: false
+      when: nextcloud_backend_status.rc != 0
+
+    - name: Stop until Nextcloud AIO setup is completed in the web interface
+      ansible.builtin.fail:
+        msg: >-
+          Nextcloud AIO is running under Docker, but the managed Nextcloud stack
+          has not finished bootstrapping yet. Open
+          https://127.0.0.1:{{ nextcloud_aio_interface_port }}/ in a local browser,
+          accept the self-signed certificate, and complete the AIO setup using the
+          Tailscale domain {{ nextcloud_tailscale_dns_name_expected }} as the
+          Nextcloud hostname. The AIO docs recommend using an IP address for the
+          setup UI on port {{ nextcloud_aio_interface_port }}. Once the AIO
+          interface has started the full stack, rerun ./run-playbook.sh -K.
+          Recent mastercontainer logs:
+          {{ nextcloud_aio_mastercontainer_logs.stdout | default('') | trim }}
+      when: nextcloud_backend_status.rc != 0
+
+    - name: Wait for Nextcloud to finish installation locally
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - status
+      register: nextcloud_occ_status
+      changed_when: false
+      retries: 40
+      delay: 10
+      until: nextcloud_occ_status.rc == 0
+
+    - name: Configure HTTPS Tailscale Serve for Nextcloud
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ nextcloud_tailscale_container_name }}"
+          - tailscale
+          - serve
+          - --bg
+          - --yes
+          - --https={{ nextcloud_tailscale_https_port }}
+          - "http://127.0.0.1:{{ nextcloud_aio_apache_port }}"
+      changed_when: false
+
+    - name: Wait for Nextcloud to answer on its Tailscale HTTPS URL
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --silent
+          - --show-error
+          - --location
+          - --http1.1
+          - --output
+          - /dev/null
+          - --connect-timeout
+          - "10"
+          - --max-time
+          - "30"
+          - "{{ nextcloud_tailscale_url }}status.php"
+      register: nextcloud_status
+      changed_when: false
+      retries: 40
+      delay: 10
+      until: nextcloud_status.rc == 0
+
+    - name: Ensure Nextcloud trusts the Tailscale hostname
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - config:system:set
+          - trusted_domains
+          - "0"
+          - --value={{ nextcloud_tailscale_dns_name }}
+      changed_when: false
+
+    - name: Ensure Nextcloud overwrite host matches the Tailscale hostname
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - config:system:set
+          - overwritehost
+          - --value={{ nextcloud_tailscale_dns_name }}
+      changed_when: false
+
+    - name: Ensure Nextcloud overwrite protocol is HTTPS
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - config:system:set
+          - overwriteprotocol
+          - --value=https
+      changed_when: false
+
+    - name: Ensure Nextcloud overwrite CLI URL matches the Tailscale URL
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - config:system:set
+          - overwrite.cli.url
+          - --value={{ nextcloud_tailscale_url }}
+      changed_when: false
+
+    - name: List currently enabled Nextcloud apps
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - app:list
+          - --enabled
+      register: nextcloud_enabled_apps
+      changed_when: false
+
+    - name: Try installing Nextcloud Talk from the appstore
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - app:install
+          - --allow-unstable
+          - "{{ nextcloud_talk_app_id }}"
+      when: nextcloud_talk_app_id not in nextcloud_enabled_apps.stdout
+      register: nextcloud_talk_install
+      changed_when: nextcloud_talk_install.rc == 0
+      failed_when: false
+
+    - name: Assert Nextcloud Talk is installed
+      ansible.builtin.assert:
+        that:
+          - nextcloud_talk_app_id in nextcloud_enabled_apps.stdout or nextcloud_talk_install.rc | default(1) == 0
+        fail_msg: >-
+          Nextcloud Talk could not be installed. Appstore output:
+          {{ nextcloud_talk_install.stdout | default('') | trim }}
+          {{ nextcloud_talk_install.stderr | default('') | trim }}
+
+    - name: List installed Nextcloud Talk bots
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - talk:bot:list
+          - --output=json
+      register: nextcloud_talk_bots
+      changed_when: false
+
+    - name: Parse installed Nextcloud Talk bots
+      ansible.builtin.set_fact:
+        nextcloud_talk_bots_json: "{{ nextcloud_talk_bots.stdout | default('[]') | from_json }}"
+
+    - name: Install the OpenClaw bot in Nextcloud Talk
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - talk:bot:install
+          - "{{ openclaw_nextcloud_talk_bot_name }}"
+          - "{{ nextcloud_talk_bot_secret }}"
+          - "{{ openclaw_tailscale_webhook_url }}"
+          - "{{ nextcloud_talk_bot_description }}"
+          - --feature
+          - webhook
+          - --feature
+          - response
+          - --feature
+          - reaction
+      when: >-
+        (
+          nextcloud_talk_bots_json
+          | selectattr('name', 'equalto', openclaw_nextcloud_talk_bot_name)
+          | list
+          | length
+        ) == 0
+      no_log: true
+
+    - name: Refresh the Nextcloud Talk bot list
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - talk:bot:list
+          - --output=json
+      register: nextcloud_talk_bots_after
+      changed_when: false
+
+    - name: Parse the refreshed bot list
+      ansible.builtin.set_fact:
+        nextcloud_talk_bots_after_json: "{{ nextcloud_talk_bots_after.stdout | default('[]') | from_json }}"
+
+    - name: Set the installed OpenClaw Talk bot id
+      ansible.builtin.set_fact:
+        nextcloud_talk_bot_id: >-
+          {{
+            (
+              nextcloud_talk_bots_after_json
+              | selectattr('name', 'equalto', openclaw_nextcloud_talk_bot_name)
+              | map(attribute='id')
+              | list
+              | first
+            )
+          }}
+
+    - name: Query bot membership for the target Talk room
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - talk:bot:list
+          - "{{ resolved_nextcloud_talk_room_token }}"
+          - --output=json
+      register: nextcloud_talk_room_bots
+      changed_when: false
+      failed_when: false
+      when: resolved_nextcloud_talk_room_token | length > 0
+
+    - name: Assert the configured Talk room token exists
+      ansible.builtin.assert:
+        that:
+          - nextcloud_talk_room_bots.rc == 0
+          - "'Conversation could not be found' not in (nextcloud_talk_room_bots.stdout | default(''))"
+        fail_msg: >-
+          The configured Nextcloud Talk room token could not be found:
+          `{{ resolved_nextcloud_talk_room_token }}`.
+          Update the Bitwarden item `{{ bitwarden_nextcloud_talk_room_token_item }}`
+          with a room token from this Nextcloud instance, or disable
+          `nextcloud_talk_room_token_from_bitwarden` and set `nextcloud_talk_room_token`
+          directly.
+          occ output: {{ nextcloud_talk_room_bots.stdout | default('') | trim }}
+          {{ nextcloud_talk_room_bots.stderr | default('') | trim }}
+      when: resolved_nextcloud_talk_room_token | length > 0
+
+    - name: Parse room bot membership
+      ansible.builtin.set_fact:
+        nextcloud_talk_room_bots_json: >-
+          {{
+            (nextcloud_talk_room_bots.stdout | from_json)
+            if ((nextcloud_talk_room_bots.stdout | default('') | trim) is match('^[\\[{]'))
+            else []
+          }}
+      when: resolved_nextcloud_talk_room_token | length > 0
+
+    - name: Attach the OpenClaw bot to the target Talk room
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - www-data
+          - "{{ nextcloud_container_name }}"
+          - php
+          - "{{ nextcloud_occ_path }}"
+          - talk:bot:setup
+          - "{{ nextcloud_talk_bot_id }}"
+          - "{{ resolved_nextcloud_talk_room_token }}"
+      register: nextcloud_talk_bot_setup
+      changed_when: nextcloud_talk_bot_setup.rc == 0
+      when:
+        - resolved_nextcloud_talk_room_token | length > 0
+        - nextcloud_talk_bot_id is defined
+        - >-
+          nextcloud_talk_bot_id | string not in
+          (nextcloud_talk_room_bots_json | map(attribute='id') | map('string') | list)
+
+    - name: Report the final service endpoints
+      ansible.builtin.debug:
+        msg:
+          - "Detected NVIDIA GPU: {{ nvidia_gpu_model }}"
+          - "Selected NVIDIA driver branch: {{ nvidia_driver_branch }}"
+          - "Host Tailnet IPv4: {{ tailscale_ipv4 }}"
+          - "Host Tailnet DNS: {{ tailscale_dns_name | regex_replace('[.]$', '') }}"
+          - "Nextcloud AIO local setup UI: https://127.0.0.1:{{ nextcloud_aio_interface_port }}/"
+          - "OpenClaw UI: {{ openclaw_tailscale_url }}"
+          - "Nextcloud UI: {{ nextcloud_tailscale_url }}"
+          - "OpenClaw Nextcloud Talk webhook: {{ openclaw_tailscale_webhook_url }}"
